@@ -431,7 +431,7 @@ _popOutWebcamOverlay(tile, userId) {
     <div class="music-pip-embed stream-pip-video"></div>
     <div class="music-pip-controls">
       <button class="music-pip-btn stream-pip-popin" title="${t('media.pop_back_in')}">⧈</button>
-      <span class="music-pip-label"><span class="music-pip-label-icon" aria-hidden="true">📷</span> ${who}</span>
+      <span class="music-pip-label"><span class="music-pip-label-icon" aria-hidden="true">📷</span> ${this._escapeHtml(who)}</span>
       <span class="music-pip-vol-icon" title="${t('voice_runtime.window_opacity')}">👁</span>
       <input type="range" class="music-pip-vol pip-opacity-slider" min="20" max="100" value="${savedOpacity}">
       <button class="music-pip-btn stream-pip-fullscreen" title="${t('media.fullscreen')}">⤢</button>
@@ -515,7 +515,7 @@ _handleScreenStream(userId, stream, { force = false } = {}) {
       // prompt has gone (#5636).
       if (!this._pendingStreamOffers) this._pendingStreamOffers = new Map();
       this._pendingStreamOffers.set(userId, stream);
-      this._showToast(t('voice.sharing_started', { who: this._escapeHtml(who) }), 'info', {
+      this._showToast(t('voice.sharing_started', { who }), 'info', {
         label: t('voice_runtime.join'),
         onClick: () => this._handleScreenStream(userId, stream, { force: true })
       }, 8000);

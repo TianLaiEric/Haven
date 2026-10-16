@@ -288,7 +288,7 @@ _fetchLinkPreviews(containerEl) {
         let meta = '';
         if (isSocial) {
           meta += '<div class="lp-author">';
-          if (data.avatar) meta += `<img class="lp-avatar" src="${this._escapeHtml(data.avatar)}" alt="" loading="lazy">`;
+          if (data.avatar) meta += `<img class="lp-avatar" ${this._imgSrcAttr(data.avatar)} alt="" loading="lazy">`;
           if (data.author) meta += `<span class="lp-author-name">${this._escapeHtml(data.author)}</span>`;
           if (data.handle) meta += `<span class="lp-handle">${this._escapeHtml(data.handle)}</span>`;
           meta += '</div>';
@@ -489,9 +489,11 @@ _wireEmbedControls(card, url) {
   });
 },
 
-/** Compact engagement count (1.2K / 3.4M); null for missing/negative values. */
-_cnt(n) {
-  if (n == null || n < 0) return null;
+/** Compact engagement count (1.2K / 3.4M); null for anything but a non-negative number. */
+_cnt(raw) {
+  if (raw == null || raw === '') return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return null;
   if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M';
   if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, '') + 'K';
   return String(n);

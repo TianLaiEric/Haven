@@ -51,10 +51,16 @@ const path = require('path');
     process.exit(1);
   }
 }
+// .env holds JWT_SECRET: readable by other accounts on a shared Linux host,
+// it would let them sign admin tokens. No effect on Windows.
+function _lockEnvFile() {
+  try { fs.chmodSync(ENV_PATH, 0o600); } catch (err) { console.warn('Could not restrict .env permissions:', err.message); }
+}
 if (!fs.existsSync(ENV_PATH)) {
   const example = path.join(__dirname, '.env.example');
   if (fs.existsSync(example)) {
     fs.copyFileSync(example, ENV_PATH);
+    _lockEnvFile();
     console.log(`📄 Created .env in ${DATA_DIR} from template`);
   } else {
     // Write a minimal .env so dotenv doesn't fail
@@ -103,7 +109,8 @@ if (process.env.JWT_SECRET === 'change-me-to-something-random-and-long' || !proc
   const generated = crypto.randomBytes(48).toString('base64');
   let envContent = fs.readFileSync(ENV_PATH, 'utf-8');
   envContent = envContent.replace(/JWT_SECRET=.*/, `JWT_SECRET=${generated}`);
-  fs.writeFileSync(ENV_PATH, envContent);
+  fs.writeFileSync(ENV_PATH, envContent, { mode: 0o600 });
+  _lockEnvFile();
   process.env.JWT_SECRET = generated;
   console.log('🔑 Auto-generated strong JWT_SECRET (saved to .env)');
 }
@@ -114,7 +121,8 @@ if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) {
   const vapidKeys = webpush.generateVAPIDKeys();
   let envContent = fs.readFileSync(ENV_PATH, 'utf-8');
   envContent += `\nVAPID_PUBLIC_KEY=${vapidKeys.publicKey}\nVAPID_PRIVATE_KEY=${vapidKeys.privateKey}\n`;
-  fs.writeFileSync(ENV_PATH, envContent);
+  fs.writeFileSync(ENV_PATH, envContent, { mode: 0o600 });
+  _lockEnvFile();
   process.env.VAPID_PUBLIC_KEY = vapidKeys.publicKey;
   process.env.VAPID_PRIVATE_KEY = vapidKeys.privateKey;
   console.log('🔔 Auto-generated VAPID keys for push notifications (saved to .env)');
@@ -129,6 +137,10 @@ const { setupSocketHandlers, sanitizeText, sanitizeSoundName, sanitizeBorderTran
 const { initFerry, stopFerry } = require('./src/ferry');
 const { threadExtras: forumBlogThreadExtras } = require('./src/forumBlog');
 const { canAccessVoiceChannel, getAccessibleVoiceChannels } = require('./src/botVoice');
+const { CREATOR_NOT_BANNED_SQL } = require('./src/botAccess');
+const { cleanWebhookName, cleanWebhookAvatarUrl } = require('./src/webhookFields');
+const { validHighScore, isKnownGame } = require('./src/highScores');
+const protectedMessages = require('./src/protectedMessages');
 const {
   BotAudioManager,
   inspectAudioFile,
@@ -393,18 +405,37 @@ function getUploadUsage() {
 // the real client IP. src/clientIp.js holds the rule, so HTTP and sockets
 // agree.
 //
-//   (unset)        default: a proxy on this machine or the local network
-//                  (loopback, link-local, private ranges). Directly exposed
-//                  servers ignore the header, so nobody can spoof their IP
+//   (unset)        default: a proxy on this machine only (inside a container,
+//                  also the container network's private ranges). Anything
+//                  else ignores the header, so nobody can spoof their IP
 //                  past the auth rate limiter or an IP ban.
+//   TRUST_PROXY=192.168.1.20  a reverse proxy on another LAN machine
 //   TRUST_PROXY=1  one hop, wherever it is (Cloudflare's proxy, or any proxy
 //                  on another machine)
 //   TRUST_PROXY=2  two hops, etc.; TRUST_PROXY=0 trusts nothing
 //
 // Without a trusted proxy every user behind one shares its IP in the auth
 // rate limiter, so innocent users would hit the limit on their first login.
-const { trustProxySetting } = require('./src/clientIp');
+const { trustProxySetting, compileTrust, normalizeIp } = require('./src/clientIp');
 app.set('trust proxy', trustProxySetting());
+
+// A proxy Haven does not trust shows up as every visitor having the proxy's
+// address. Say so once per address, with the setting that fixes it, rather
+// than leave the owner to puzzle over shared rate limits.
+{
+  const trusted = compileTrust(trustProxySetting());
+  const warned = new Set();
+  app.use((req, res, next) => {
+    if (warned.size < 20 && req.headers['x-forwarded-for']) {
+      const peer = normalizeIp(req.socket?.remoteAddress || '');
+      if (peer && !warned.has(peer) && !trusted(peer, 0)) {
+        warned.add(peer);
+        console.warn(`[proxy] ${peer} sent X-Forwarded-For, but Haven does not trust it as a proxy, so everyone coming through it shares that address. If ${peer} is your reverse proxy, set TRUST_PROXY=${peer} in .env and restart.`);
+      }
+    }
+    next();
+  });
+}
 
 // ── IP ban gate (v3.20.0) ─────────────────────────────────
 // Run before anything else (parsers, helmet, static) so banned addresses
@@ -443,6 +474,9 @@ function isIpBanned(ip) {
   if (Date.now() > _ipBanCache.expires) _refreshIpBanCache();
   const norm = _clientIp.normalizeIp(ip);
   if (!norm) return false;
+  // This machine always gets in, so whoever runs the server can lift a ban
+  // that went too far, even one placed before ban-ip refused them.
+  if (norm === '127.0.0.1' || norm === '::1') return false;
   if (_ipBanCache.set.has(norm)) return true;
   return _ipBanCache.cidrs.some(c => _clientIp.ipMatches(norm, c));
 }
@@ -712,6 +746,13 @@ const BLOCKED_UPLOAD_DIRS = ['deleted-attachments', 'bot-audio'].map(
 app.use('/uploads', (req, res, next) => {
   let decoded;
   try { decoded = decodeURIComponent(req.path); } catch { return res.status(400).end(); }
+  // Windows also answers to a folder's 8.3 short name (DELETE~1 for
+  // deleted-attachments), and ignores a trailing dot or space and anything
+  // after a colon (alternate streams). None of those appear in a real upload
+  // name, so a path with any of them is refused before it can slip past.
+  if (decoded.split(/[\\/]/).some(seg => seg.includes('~') || seg.includes(':') || /[. ]$/.test(seg))) {
+    return res.status(404).end();
+  }
   // path.resolve treats a backslash as a separator on Windows and as an
   // ordinary filename character on Linux, which is exactly right in both
   // cases, so the raw decoded path goes in as-is.
@@ -866,7 +907,9 @@ function cappedUpload(options) {
   return {
     single: (field) => (req, res, next) => {
       const capMb = uploadCapMbFor(req);
-      multer({ ...options, limits: { fileSize: capMb * 1024 * 1024 + 1 } }).single(field)(req, res, (err) => {
+      // Text fields are held in memory, and busboy allows any number of them
+      // by default; a handful of short ones is all any upload form sends.
+      multer({ ...options, limits: { fileSize: capMb * 1024 * 1024 + 1, fields: 20, fieldSize: 16 * 1024 } }).single(field)(req, res, (err) => {
         if (err && err.code === 'LIMIT_FILE_SIZE') err.message = `File too large (max ${capMb} MB)`;
         next(err);
       });
@@ -1283,23 +1326,17 @@ app.get('/app', (req, res) => {
 });
 
 // ── Vanity invite link (/invite/:code) ────────────────
-app.get('/invite/:vanityCode', (req, res) => {
+// The answer is the same redirect whether or not the code exists, so this
+// page cannot be used to test guesses at short custom invite slugs; the app
+// passes ?invite= to join-channel, which checks the code (and its enabled,
+// expiry and use-limit rules) for a signed-in member. The limit is per IP,
+// generous for people following links and tight for a guessing script.
+const inviteLinkLimiter = require('express-rate-limit')({ windowMs: 60 * 1000, max: 30, message: 'Too many invite links, try again in a minute' });
+app.get('/invite/:vanityCode', inviteLinkLimiter, (req, res) => {
   const vanityCode = req.params.vanityCode;
   if (!vanityCode || typeof vanityCode !== 'string' || !/^[a-zA-Z0-9_-]{3,32}$/.test(vanityCode)) {
     return res.status(400).send('Invalid invite link');
   }
-  const { getDb } = require('./src/database');
-  const db = getDb();
-  // Accept either the legacy single vanity_code setting or any managed invite
-  // code (from the invite-link menu). The frontend auto-joins from ?invite=;
-  // enabled/expiry/use-limit are enforced server-side when join-channel fires.
-  const row = db.prepare("SELECT value FROM server_settings WHERE key = 'vanity_code'").get();
-  const isLegacyVanity = row && row.value === vanityCode;
-  const managed = isLegacyVanity ? null : db.prepare('SELECT 1 FROM invite_codes WHERE code = ?').get(vanityCode);
-  if (!isLegacyVanity && !managed) {
-    return res.status(404).send('Invite link not found or expired');
-  }
-  // Redirect to /app with the code as a query param; the frontend will auto-join
   res.redirect(`/app?invite=${encodeURIComponent(vanityCode)}`);
 });
 
@@ -1785,9 +1822,10 @@ app.post('/api/high-scores', express.json(), (req, res) => {
   if (!user) return res.status(401).json({ error: 'Unauthorized' });
 
   const game = typeof req.body.game === 'string' ? req.body.game.trim() : '';
-  const score = Number(req.body.score);
-  if (!game || !/^[a-z0-9_-]{1,32}$/.test(game)) return res.status(400).json({ error: 'Invalid game id' });
-  if (!Number.isInteger(score) || score < 0) return res.status(400).json({ error: 'Invalid score' });
+  if (!game || !/^[a-z0-9_-]{1,32}$/.test(game) || !isKnownGame(game)) return res.status(400).json({ error: 'Invalid game id' });
+  // A JSON number only: no strings, and nothing past the game's ceiling.
+  const score = typeof req.body.score === 'number' ? validHighScore(game, req.body.score) : null;
+  if (score === null) return res.status(400).json({ error: 'Invalid score' });
 
   const { getDb } = require('./src/database');
   const db = getDb();
@@ -1827,8 +1865,9 @@ app.post('/api/webhooks/:token', webhookLimiter, express.json({ limit: '64kb' })
     return res.status(400).json({ error: 'Invalid token' });
   }
 
+  // Same rule as getWebhookByToken: a banned person's bots stop posting.
   const webhook = db.prepare(
-    'SELECT w.*, c.code as channel_code, c.name as channel_name FROM webhooks w JOIN channels c ON w.channel_id = c.id WHERE w.token = ? AND w.is_active = 1 AND c.is_dm = 0'
+    `SELECT w.*, c.code as channel_code, c.name as channel_name FROM webhooks w JOIN channels c ON w.channel_id = c.id WHERE w.token = ? AND w.is_active = 1 AND c.is_dm = 0 AND ${CREATOR_NOT_BANNED_SQL}`
   ).get(token);
 
   if (!webhook) {
@@ -1841,12 +1880,11 @@ app.post('/api/webhooks/:token', webhookLimiter, express.json({ limit: '64kb' })
   }
 
   // Optional overrides per-message
-  const username = typeof req.body.username === 'string' ? sanitizeText(req.body.username.trim().slice(0, 32)) : webhook.name;
+  const username = (typeof req.body.username === 'string' && cleanWebhookName(sanitizeText(req.body.username))) || webhook.name;
+  // Only this server's uploads or https images (loaded through the media
+  // proxy), never a plain http or other scheme URL every reader fetches.
   let avatarUrl = webhook.avatar_url;
-  if (typeof req.body.avatar_url === 'string') {
-    const trimmed = req.body.avatar_url.trim().slice(0, 512);
-    avatarUrl = /^https?:\/\//i.test(trimmed) ? trimmed : null;
-  }
+  if (typeof req.body.avatar_url === 'string') avatarUrl = cleanWebhookAvatarUrl(req.body.avatar_url);
 
   // Optional reply_to: bot replying to a message in the same channel (3.13.0)
   let replyTo = null;
@@ -1948,8 +1986,8 @@ app.post('/api/webhooks/:token', webhookLimiter, express.json({ limit: '64kb' })
 
   // Insert non-ephemeral messages into the DB/history.
   const result = db.prepare(
-    'INSERT INTO messages (channel_id, user_id, content, is_webhook, webhook_username, webhook_avatar, reply_to, thread_id) VALUES (?, ?, ?, 1, ?, ?, ?, ?)'
-  ).run(webhook.channel_id, null, content, username, avatarUrl || null, replyTo, threadId);
+    'INSERT INTO messages (channel_id, user_id, content, is_webhook, webhook_username, webhook_avatar, reply_to, thread_id, webhook_id) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)'
+  ).run(webhook.channel_id, null, content, username, avatarUrl || null, replyTo, threadId, webhook.id);
   message.id = result.lastInsertRowid;
 
   // Broadcast to all clients in this channel
@@ -2266,9 +2304,24 @@ app.delete('/api/webhooks/:token/messages/:messageId', webhookLimiter, (req, res
   const mid = parseInt(messageId, 10);
   if (!Number.isInteger(mid) || mid < 1) return res.status(400).json({ error: 'Invalid message ID' });
 
-  const msg = db.prepare('SELECT id, content, channel_id FROM messages WHERE id = ? AND channel_id = ?').get(mid, webhook.channel_id);
+  const msg = db.prepare('SELECT id, content, channel_id, is_webhook, webhook_id FROM messages WHERE id = ? AND channel_id = ?').get(mid, webhook.channel_id);
   if (!msg) return res.status(404).json({ error: 'Message not found in this channel' });
+  // A bot deletes its own messages. Anyone else's, people's or another
+  // bot's, needs a bot with moderation permission, as the bulk delete below
+  // already required.
+  if (!webhook.can_moderate && !(msg.is_webhook && msg.webhook_id === webhook.id)) {
+    return res.status(403).json({ error: 'This bot can only delete its own messages' });
+  }
+  // Someone else's message also needs the bot's creator to still hold
+  // delete_message here, as for the kick, ban and mute routes.
+  const ownMessage = !!msg.is_webhook && msg.webhook_id === webhook.id;
+  if (!ownMessage && !botModAuth(webhook, 'delete_message', webhook.channel_id)) {
+    return res.status(403).json({ error: BOT_MOD_DENIED });
+  }
+  const kept = protectedMessages.refusal(db, mid);
+  if (kept) return res.status(409).json({ error: kept });
 
+  const replies = db.prepare('SELECT content FROM messages WHERE thread_id = ?').all(mid);
   try {
     db.prepare('DELETE FROM pinned_messages WHERE message_id = ?').run(mid);
     db.prepare('DELETE FROM reactions WHERE message_id = ?').run(mid);
@@ -2278,11 +2331,14 @@ app.delete('/api/webhooks/:token/messages/:messageId', webhookLimiter, (req, res
     return res.status(500).json({ error: 'Failed to delete message' });
   }
 
-  // Move any uploaded attachments to the deleted folder
-  const uploadRe = UPLOAD_PATH_RE;
-  let m;
-  while ((m = uploadRe.exec(msg.content || '')) !== null) {
-    moveUploadToDeleted(m[1], uploadDir);
+  // Its files, and its replies' files, go only when nothing else uses them
+  // and they were uploaded to a channel. Moving every /uploads/ path the text
+  // named let a message that quoted someone's avatar or an emoji take that
+  // file away from everyone.
+  try {
+    relocateUnreferencedUploads(db, collectUploadRelPaths([msg.content, ...replies.map(r => r.content)]));
+  } catch (err) {
+    console.error('Bot delete attachment cleanup error:', err);
   }
 
   // Find channel code for broadcasting
@@ -2298,6 +2354,7 @@ app.delete('/api/webhooks/:token/messages/:messageId', webhookLimiter, (req, res
 });
 
 // ── Bot: Delete recent messages and their replies ─────────
+// Protected messages, and thread heads holding one, are left out.
 app.delete('/api/webhooks/:token/messages', webhookLimiter, (req, res) => {
   const webhook = requireModBot(req, res);
   if (!webhook) return;
@@ -2315,6 +2372,8 @@ app.delete('/api/webhooks/:token/messages', webhookLimiter, (req, res) => {
   const db = getDb();
   const channel = db.prepare('SELECT id, code FROM channels WHERE id = ?').get(webhook.channel_id);
   if (!channel) return res.status(404).json({ error: 'Channel not found' });
+  // The creator must still hold delete_message in this channel.
+  if (!botModAuth(webhook, 'delete_message', channel.id)) return res.status(403).json({ error: BOT_MOD_DENIED });
 
   const selectMessages = db.prepare(`
     WITH RECURSIVE
@@ -2340,6 +2399,7 @@ app.delete('/api/webhooks/:token/messages', webhookLimiter, (req, res) => {
     SELECT m.id, m.channel_id, m.content
     FROM messages m
     JOIN doomed d ON d.id = m.id
+    WHERE ${protectedMessages.deletableSql('m')}
     ORDER BY m.id DESC
   `);
   const deletePin = db.prepare('DELETE FROM pinned_messages WHERE message_id = ?');
@@ -2486,12 +2546,13 @@ app.post('/api/moderation/kick', modLimiter, express.json({ limit: '16kb' }), (r
   if (!userId || !Number.isInteger(userId)) return res.status(400).json({ error: 'userId required (integer)' });
   if (!channelCode || typeof channelCode !== 'string') return res.status(400).json({ error: 'channelCode required' });
 
-  const channel = db.prepare('SELECT id FROM channels WHERE code = ?').get(channelCode);
+  const channel = db.prepare('SELECT id FROM channels WHERE code = ? AND is_dm = 0').get(channelCode);
   if (!channel) return res.status(404).json({ error: 'Channel not found' });
 
   const target = db.prepare('SELECT id, COALESCE(display_name, username) as username FROM users WHERE id = ?').get(userId);
   if (!target) return res.status(404).json({ error: 'User not found' });
   if (!modOutranks(auth, userId)) return res.status(403).json({ error: 'You can only kick people ranked below you' });
+  httpModAudit(auth, 'user_kick', userId, target.username, { channel: channelCode });
 
   db.prepare('DELETE FROM channel_members WHERE channel_id = ? AND user_id = ?').run(channel.id, userId);
 
@@ -2523,8 +2584,12 @@ app.post('/api/moderation/ban', modLimiter, express.json({ limit: '16kb' }), (re
   if (!target) return res.status(404).json({ error: 'User not found' });
   if (target.is_admin) return res.status(403).json({ error: 'Cannot ban an admin' });
   if (!modOutranks(auth, userId)) return res.status(403).json({ error: 'You can only ban people ranked below you' });
+  // Banning again takes over the ban, and with it who may lift it.
+  const priorBan = db.prepare('SELECT banned_by FROM bans WHERE user_id = ?').get(userId);
+  if (priorBan && !modMayUndo(auth, priorBan.banned_by)) return res.status(403).json({ error: 'That ban was placed by an admin or by someone of equal or higher rank' });
 
   const safeReason = typeof reason === 'string' ? reason.trim().slice(0, 200) : '';
+  httpModAudit(auth, 'user_ban', userId, target.username, { reason: safeReason });
 
   try {
     db.prepare('INSERT OR REPLACE INTO bans (user_id, banned_by, reason) VALUES (?, ?, ?)').run(userId, auth.user.id, safeReason);
@@ -2560,6 +2625,7 @@ app.post('/api/moderation/unban', modLimiter, express.json({ limit: '16kb' }), (
 
   db.prepare('DELETE FROM bans WHERE user_id = ?').run(userId);
   const target = db.prepare('SELECT COALESCE(display_name, username) as username FROM users WHERE id = ?').get(userId);
+  if (existingBan) httpModAudit(auth, 'user_unban', userId, target ? target.username : null, null);
   res.json({ success: true, message: `Unbanned ${target ? target.username : 'user'}` });
 });
 
@@ -2576,6 +2642,11 @@ app.post('/api/moderation/mute', modLimiter, express.json({ limit: '16kb' }), (r
   const target = db.prepare('SELECT id, COALESCE(display_name, username) as username FROM users WHERE id = ?').get(userId);
   if (!target) return res.status(404).json({ error: 'User not found' });
   if (!modOutranks(auth, userId)) return res.status(403).json({ error: 'You can only mute people ranked below you' });
+  // A new timeout replaces the old one, and with it who may lift it.
+  for (const { muted_by: by } of db.prepare("SELECT DISTINCT muted_by FROM mutes WHERE user_id = ? AND expires_at > datetime('now')").all(userId)) {
+    if (!modMayUndo(auth, by)) return res.status(403).json({ error: 'That timeout was given by an admin or by someone of equal or higher rank' });
+  }
+  httpModAudit(auth, 'user_mute', userId, target.username, { duration });
 
   // Same ceiling as the app: 30 days.
   const durationMs = Number.isInteger(duration) && duration > 0 ? Math.min(duration, 43200) * 60 * 1000 : 10 * 60 * 1000;
@@ -2612,6 +2683,7 @@ app.post('/api/moderation/unmute', modLimiter, express.json({ limit: '16kb' }), 
 
   db.prepare('DELETE FROM mutes WHERE user_id = ?').run(userId);
   const target = db.prepare('SELECT COALESCE(display_name, username) as username FROM users WHERE id = ?').get(userId);
+  httpModAudit(auth, 'user_unmute', userId, target ? target.username : null, null);
   res.json({ success: true, message: `Unmuted ${target ? target.username : 'user'}` });
 });
 
@@ -2655,6 +2727,7 @@ function getWebhookByToken(token) {
     FROM webhooks w
     LEFT JOIN channels c ON c.id = w.channel_id
     WHERE w.token = ? AND w.is_active = 1 AND COALESCE(c.is_dm, 0) = 0
+      AND ${CREATOR_NOT_BANNED_SQL}
   `).get(token);
 }
 
@@ -2714,6 +2787,30 @@ function requireModBot(req, res) {
   if (!webhook.can_moderate) { res.status(403).json({ error: 'This bot does not have moderation permission' }); return null; }
   return webhook;
 }
+// A moderation bot acts with the rank of the person who made it, so it can
+// do no more than they could themselves: nobody at or above them, and no
+// undoing an admin's or a higher-ranked moderator's ban or mute. A bot with
+// no creator on record acts with no rank at all.
+// It also needs the creator to hold, today, the permission the route uses:
+// a bot keeps no power its maker has since lost.
+const BOT_MOD_DENIED = 'The person who made this bot no longer has this moderation permission';
+function botModAuth(webhook, permission, channelId = null) {
+  if (!webhook || !webhook.created_by || !permission) return null;
+  const { getDb } = require('./src/database');
+  const creator = getDb().prepare('SELECT id, username, display_name, is_admin FROM users WHERE id = ?').get(webhook.created_by);
+  if (!creator) return null;
+  if (!creator.is_admin && !(socketRuntime && socketRuntime.userHasPermission(creator.id, permission, channelId))) return null;
+  return { user: { id: creator.id, username: creator.username, displayName: creator.display_name || creator.username }, isAdmin: !!creator.is_admin, bot: webhook };
+}
+function httpModAudit(auth, action, targetId, targetName, details) {
+  try {
+    socketRuntime?.logAudit?.({
+      actor: { id: auth.user.id, username: auth.user.username, displayName: auth.user.displayName || auth.user.username },
+      action, target_type: 'user', target_id: targetId, target_name: targetName || null,
+      details: { ...(details || {}), via: auth.bot ? `bot ${auth.bot.name}` : 'api' },
+    });
+  } catch (err) { console.warn('[audit] HTTP moderation entry failed:', err.message); }
+}
 
 // POST /api/webhooks/:token/moderation/kick
 app.post('/api/webhooks/:token/moderation/kick', webhookLimiter, express.json({ limit: '16kb' }), (req, res) => {
@@ -2724,11 +2821,16 @@ app.post('/api/webhooks/:token/moderation/kick', webhookLimiter, express.json({ 
   if (!Number.isInteger(userId)) return res.status(400).json({ error: 'userId required (integer)' });
   if (!channelCode || typeof channelCode !== 'string') return res.status(400).json({ error: 'channelCode required' });
 
-  const channel = db.prepare('SELECT id FROM channels WHERE code = ?').get(channelCode);
+  // Only from the bot's own channel.
+  const channel = db.prepare('SELECT id FROM channels WHERE code = ? AND id = ? AND is_dm = 0').get(channelCode, webhook.channel_id);
   if (!channel) return res.status(404).json({ error: 'Channel not found' });
   const target = db.prepare('SELECT id, COALESCE(display_name, username) as username, is_admin FROM users WHERE id = ?').get(userId);
   if (!target) return res.status(404).json({ error: 'User not found' });
   if (target.is_admin) return res.status(403).json({ error: 'Cannot kick an admin' });
+  const botAuth = botModAuth(webhook, 'kick_user', channel.id);
+  if (!botAuth) return res.status(403).json({ error: BOT_MOD_DENIED });
+  if (!modOutranks(botAuth, userId)) return res.status(403).json({ error: 'This bot can only act on people ranked below the person who made it' });
+  httpModAudit(botAuth, 'user_kick', userId, target.username, { channel: channelCode });
 
   db.prepare('DELETE FROM channel_members WHERE channel_id = ? AND user_id = ?').run(channel.id, userId);
 
@@ -2756,8 +2858,14 @@ app.post('/api/webhooks/:token/moderation/ban', webhookLimiter, express.json({ l
   const target = db.prepare('SELECT id, COALESCE(display_name, username) as username, is_admin FROM users WHERE id = ?').get(userId);
   if (!target) return res.status(404).json({ error: 'User not found' });
   if (target.is_admin) return res.status(403).json({ error: 'Cannot ban an admin' });
+  const botAuth = botModAuth(webhook, 'ban_user');
+  if (!botAuth) return res.status(403).json({ error: BOT_MOD_DENIED });
+  if (!modOutranks(botAuth, userId)) return res.status(403).json({ error: 'This bot can only act on people ranked below the person who made it' });
+  const priorBan = db.prepare('SELECT banned_by FROM bans WHERE user_id = ?').get(userId);
+  if (priorBan && !modMayUndo(botAuth, priorBan.banned_by)) return res.status(403).json({ error: 'That ban was placed by someone of equal or higher rank' });
 
   const safeReason = typeof reason === 'string' ? reason.trim().slice(0, 200) : '';
+  httpModAudit(botAuth, 'user_ban', userId, target.username, { reason: safeReason });
   try {
     db.prepare('INSERT OR REPLACE INTO bans (user_id, banned_by, reason) VALUES (?, ?, ?)').run(userId, webhook.created_by || null, safeReason);
   } catch {
@@ -2779,6 +2887,13 @@ app.post('/api/webhooks/:token/moderation/unban', webhookLimiter, express.json({
   const db = getDb();
   const { userId } = req.body || {};
   if (!Number.isInteger(userId)) return res.status(400).json({ error: 'userId required (integer)' });
+  const botAuth = botModAuth(webhook, 'ban_user');
+  if (!botAuth) return res.status(403).json({ error: BOT_MOD_DENIED });
+  const existingBan = db.prepare('SELECT banned_by FROM bans WHERE user_id = ?').get(userId);
+  if (existingBan && !modMayUndo(botAuth, existingBan.banned_by)) {
+    return res.status(403).json({ error: 'You can\'t undo a ban placed by an admin or by someone of equal or higher rank' });
+  }
+  if (existingBan) httpModAudit(botAuth, 'user_unban', userId, null, null);
 
   db.prepare('DELETE FROM bans WHERE user_id = ?').run(userId);
   const target = db.prepare('SELECT COALESCE(display_name, username) as username FROM users WHERE id = ?').get(userId);
@@ -2796,8 +2911,16 @@ app.post('/api/webhooks/:token/moderation/mute', webhookLimiter, express.json({ 
   const target = db.prepare('SELECT id, COALESCE(display_name, username) as username, is_admin FROM users WHERE id = ?').get(userId);
   if (!target) return res.status(404).json({ error: 'User not found' });
   if (target.is_admin) return res.status(403).json({ error: 'Cannot mute an admin' });
+  const botAuth = botModAuth(webhook, 'mute_user');
+  if (!botAuth) return res.status(403).json({ error: BOT_MOD_DENIED });
+  if (!modOutranks(botAuth, userId)) return res.status(403).json({ error: 'This bot can only act on people ranked below the person who made it' });
+  for (const { muted_by: by } of db.prepare("SELECT DISTINCT muted_by FROM mutes WHERE user_id = ? AND expires_at > datetime('now')").all(userId)) {
+    if (!modMayUndo(botAuth, by)) return res.status(403).json({ error: 'That timeout was given by someone of equal or higher rank' });
+  }
+  httpModAudit(botAuth, 'user_mute', userId, target.username, { duration });
 
-  const durationMs = Number.isInteger(duration) && duration > 0 ? duration * 60 * 1000 : 10 * 60 * 1000;
+  // Same ceiling as the app: 30 days.
+  const durationMs = Number.isInteger(duration) && duration > 0 ? Math.min(duration, 43200) * 60 * 1000 : 10 * 60 * 1000;
   const expiresAt = new Date(Date.now() + durationMs).toISOString();
   const safeReason = typeof reason === 'string' ? reason.trim().slice(0, 200) : '';
 
@@ -2819,6 +2942,12 @@ app.post('/api/webhooks/:token/moderation/unmute', webhookLimiter, express.json(
   const db = getDb();
   const { userId } = req.body || {};
   if (!Number.isInteger(userId)) return res.status(400).json({ error: 'userId required (integer)' });
+  const botAuth = botModAuth(webhook, 'mute_user');
+  if (!botAuth) return res.status(403).json({ error: BOT_MOD_DENIED });
+  for (const { muted_by: by } of db.prepare("SELECT DISTINCT muted_by FROM mutes WHERE user_id = ? AND expires_at > datetime('now')").all(userId)) {
+    if (!modMayUndo(botAuth, by)) return res.status(403).json({ error: 'You can\'t undo a timeout given by an admin or by someone of equal or higher rank' });
+  }
+  httpModAudit(botAuth, 'user_unmute', userId, null, null);
 
   db.prepare('DELETE FROM mutes WHERE user_id = ?').run(userId);
   const target = db.prepare('SELECT COALESCE(display_name, username) as username FROM users WHERE id = ?').get(userId);
@@ -2914,15 +3043,22 @@ app.delete('/api/webhooks/:token/commands/:command', webhookLimiter, (req, res) 
 });
 
 // GET /api/bot-commands: list all registered bot commands (for client autocomplete)
+// Signed in only, and only bots in channels the caller can see: open to
+// anyone, it listed the invite code of every channel with a bot command.
 app.get('/api/bot-commands', (req, res) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  const user = token ? verifyToken(token) : null;
+  if (!user) return res.status(401).json({ error: 'Unauthorized' });
   const { getDb } = require('./src/database');
+  const isAdmin = verifyAdminFromDb(user);
   const rows = getDb().prepare(`
-    SELECT bc.command, bc.description, bc.subcommands_json, w.name as bot_name, c.code as channel_code
+    SELECT bc.command, bc.description, bc.subcommands_json, w.name as bot_name, c.code as channel_code, c.id AS channel_id, c.role_gate
     FROM bot_commands bc
     JOIN webhooks w ON bc.webhook_id = w.id
-    LEFT JOIN channels c ON c.id = w.channel_id
-    WHERE w.is_active = 1
-  `).all();
+    JOIN channels c ON c.id = w.channel_id
+    JOIN channel_members cm ON cm.channel_id = c.id AND cm.user_id = ?
+    WHERE w.is_active = 1 AND ${CREATOR_NOT_BANNED_SQL}
+  `).all(user.id).filter(r => isAdmin || !socketRuntime || socketRuntime.roleGateAllows(user.id, { id: r.channel_id, role_gate: r.role_gate }));
   const commands = [];
   for (const row of rows) {
     let subcommands = [];
@@ -2961,7 +3097,6 @@ app.get('/api/bot-commands', (req, res) => {
 // DISCORD IMPORT: upload, preview, execute
 // ═══════════════════════════════════════════════════════════
 const os = require('os');
-const { parseDiscordExport } = require('./src/importDiscord');
 
 // Multer instance for import uploads (ZIP/JSON up to 500 MB)
 const importUpload = multer({
@@ -2972,7 +3107,7 @@ const importUpload = multer({
       cb(null, `haven-import-${Date.now()}-${crypto.randomBytes(8).toString('hex')}${ext}`);
     }
   }),
-  limits: { fileSize: 500 * 1024 * 1024 },
+  limits: { fileSize: 500 * 1024 * 1024, fields: 20, fieldSize: 16 * 1024 },
   fileFilter: (req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
     if (ext === '.json' || ext === '.zip') cb(null, true);
@@ -2982,203 +3117,6 @@ const importUpload = multer({
 
 // ── Discord import: src/routes/import.js ──
 require('./src/routes/import')({ uploadDiskGuard, app, verifyAdminFromDb, uploadLimiter, importUpload });
-
-// ── Step 2: Execute the import ───────────────────────────
-app.post('/api/import/discord/execute', express.json({ limit: '1mb' }), (req, res) => {
-  const token = req.headers.authorization?.split(' ')[1];
-  const user = token ? verifyToken(token) : null;
-  if (!user || !verifyAdminFromDb(user)) return res.status(403).json({ error: 'Admin only' });
-
-  const { importId, selectedChannels } = req.body;
-  if (!importId || !Array.isArray(selectedChannels) || selectedChannels.length === 0) {
-    return res.status(400).json({ error: 'Missing importId or selectedChannels' });
-  }
-
-  // Validate importId is hex-only (prevent path traversal)
-  if (!/^[a-f0-9]{32}$/.test(importId)) {
-    return res.status(400).json({ error: 'Invalid import ID' });
-  }
-
-  const tempPath = path.join(os.tmpdir(), `haven-import-${importId}.json`);
-  if (!fs.existsSync(tempPath)) {
-    return res.status(404).json({ error: 'Import data expired or not found. Please re-upload.' });
-  }
-
-  try {
-    const data = JSON.parse(fs.readFileSync(tempPath, 'utf-8'));
-    const { getDb } = require('./src/database');
-    const db = getDb();
-    const { generateChannelCode } = require('./src/auth');
-    const { generateUniqueChannelCode } = require('./src/channelRotation');
-
-    const stats = { channelsCreated: 0, channelsReused: 0, messagesImported: 0, messagesSkipped: 0, threadsImported: 0 };
-
-    // Where an imported message goes. user_id is NULL: imported messages
-    // belong to no Haven account (#5771, src/importAuthors.js).
-    const insertMsg = db.prepare(`
-      INSERT OR IGNORE INTO messages (channel_id, user_id, content, created_at, webhook_username, webhook_avatar, is_webhook, imported_from, reply_to, discord_message_id, thread_id, title, tags)
-      VALUES (?, NULL, ?, ?, ?, ?, 0, 'discord', ?, ?, ?, ?, ?)
-    `);
-    const lookupByDiscordId = db.prepare('SELECT id FROM messages WHERE channel_id = ? AND discord_message_id = ?');
-    const toTs = (raw) => {
-      try { return new Date(raw).toISOString().replace('T', ' ').replace('Z', ''); }
-      catch { return raw; }
-    };
-
-    // Adds one channel's (or one thread's) messages, oldest first. Duplicates
-    // (same Discord id in the same channel) are skipped, which is what makes
-    // importing again, or importing what Ferry already carried, safe.
-    const importMessages = (channelId, messages, { threadId = null } = {}) => {
-      const sorted = messages.slice().sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-      const idMap = {}; // Discord message id -> Haven id, for replies
-      for (const msg of sorted) {
-        const content = (msg.content || '').trim();
-        if (!content) continue;
-        const replyTo = msg.replyTo && idMap[msg.replyTo] ? idMap[msg.replyTo] : null;
-        const result = insertMsg.run(
-          channelId, content, toTs(msg.timestamp), msg.author || 'Unknown', msg.authorAvatar || null,
-          replyTo, msg.discordId || null, threadId, null, null
-        );
-        if (result.changes === 0) {
-          if (msg.discordId) {
-            const existing = lookupByDiscordId.get(channelId, msg.discordId);
-            if (existing) idMap[msg.discordId] = existing.id;
-          }
-          stats.messagesSkipped++;
-          continue;
-        }
-        if (msg.discordId) idMap[msg.discordId] = result.lastInsertRowid;
-        stats.messagesImported++;
-
-        if (msg.isPinned && !threadId) {
-          try {
-            db.prepare('INSERT INTO pinned_messages (message_id, channel_id, pinned_by) VALUES (?, ?, ?)')
-              .run(result.lastInsertRowid, channelId, user.id);
-          } catch (err) {
-            // Do not abort the import over one pin, but do not lose it silently either.
-            console.warn('[import] Could not pin an imported message:', err.message);
-          }
-        }
-        if (Array.isArray(msg.reactions)) {
-          for (const r of msg.reactions) {
-            if (!r.emoji) continue;
-            try {
-              db.prepare('INSERT OR IGNORE INTO reactions (message_id, user_id, emoji) VALUES (?, ?, ?)')
-                .run(result.lastInsertRowid, user.id, r.emoji);
-            } catch { /* a reaction is cosmetic and can number in the thousands; never abort the import over one */ }
-          }
-        }
-      }
-    };
-
-    // A Discord thread inside a channel that is in Haven (#5772): its
-    // messages become a Haven thread there. In a forum the post becomes a
-    // topic, its first message the opening post. In a chat channel the
-    // thread hangs from the message it was started from, or from a line with
-    // its name when that message is not in Haven.
-    const importThread = (parent, channelData) => {
-      const threadDiscordId = channelData.discordId;
-      const messages = channelData.messages || [];
-      let root = lookupByDiscordId.get(parent.id, threadDiscordId);
-      let replies = messages;
-      if (parent.is_forum) {
-        const starter = messages.find(m => m.discordId === threadDiscordId)
-          || messages.slice().sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))[0];
-        if (!root) {
-          if (!starter) return;
-          const title = sanitizeText(String(channelData.name || '').trim().replace(/\s+/g, ' ').slice(0, 120)) || 'Untitled';
-          const tags = Array.isArray(channelData.tags) && channelData.tags.length ? JSON.stringify(channelData.tags.slice(0, 5)) : null;
-          const r = insertMsg.run(
-            parent.id, (starter.content || '').trim() || title, toTs(starter.timestamp), starter.author || 'Unknown',
-            starter.authorAvatar || null, null, threadDiscordId, null, title, tags
-          );
-          root = { id: r.lastInsertRowid };
-          stats.messagesImported++;
-        }
-        replies = messages.filter(m => m !== starter);
-      } else if (!root) {
-        const first = messages.slice().sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))[0];
-        if (!first) return;
-        const r = insertMsg.run(
-          parent.id, `🧵 ${sanitizeText(String(channelData.name || '').slice(0, 100)) || 'Thread'}`, toTs(first.timestamp),
-          first.author || 'Unknown', first.authorAvatar || null, null, threadDiscordId, null, null, null
-        );
-        root = { id: r.lastInsertRowid };
-      }
-      importMessages(parent.id, replies, { threadId: root.id });
-      stats.threadsImported++;
-    };
-
-    const txn = db.transaction(() => {
-      // Channels first, so a thread finds its parent already in Haven.
-      const entries = [];
-      for (const sel of selectedChannels) {
-        // Find channel data by discordId or original name
-        const channelData = data.channels.find(c =>
-          (sel.discordId && c.discordId === sel.discordId) ||
-          c.name === sel.originalName
-        );
-        if (!channelData || !channelData.messages) continue;
-        entries.push({ sel, channelData });
-      }
-      entries.sort((a, b) => (a.channelData.kind === 'thread') - (b.channelData.kind === 'thread'));
-
-      for (const { sel, channelData } of entries) {
-        const discordChannelId = channelData.discordId || null;
-
-        if (channelData.kind === 'thread' && channelData.parentId) {
-          const parent = db.prepare('SELECT id, is_forum FROM channels WHERE discord_channel_id = ?').get(channelData.parentId);
-          if (parent) { importThread(parent, channelData); continue; }
-          // Its channel is not in Haven: the thread gets a channel of its own.
-        }
-
-        const channelName = [...(sel.name || channelData.name)].slice(0, 50).join('');
-        const code = generateUniqueChannelCode(db, generateChannelCode);
-
-        // Reuse an existing Haven channel if it was created from the same Discord channel.
-        // This makes re-importing (or importing a second overlapping export) idempotent:
-        // new messages are appended, duplicates are skipped, and native Haven messages are untouched.
-        let channelId;
-        if (discordChannelId) {
-          const existing = db.prepare('SELECT id FROM channels WHERE discord_channel_id = ?').get(discordChannelId);
-          if (existing) {
-            channelId = existing.id;
-            stats.channelsReused++;
-          }
-        }
-
-        if (!channelId) {
-          // A Discord forum (or media channel) becomes a Haven forum with the
-          // same tags; its posts come in as topics (#5772).
-          const isForum = channelData.kind === 'forum' || channelData.kind === 'media';
-          const forumTags = isForum && Array.isArray(channelData.tags) && channelData.tags.length
-            ? JSON.stringify(channelData.tags.slice(0, 20).map(name => ({ name })))
-            : null;
-          const chResult = db.prepare(
-            'INSERT INTO channels (name, code, created_by, topic, discord_channel_id, is_forum, forum_tags) VALUES (?, ?, ?, ?, ?, ?, ?)'
-          ).run(channelName, code, user.id, channelData.topic || '', discordChannelId, isForum ? 1 : 0, forumTags);
-          channelId = chResult.lastInsertRowid;
-
-          // Auto-join the importing admin
-          db.prepare('INSERT OR IGNORE INTO channel_members (channel_id, user_id) VALUES (?, ?)').run(channelId, user.id);
-          stats.channelsCreated++;
-        }
-
-        importMessages(channelId, channelData.messages);
-      }
-    });
-
-    txn();
-
-    // Clean up temp file
-    try { fs.unlinkSync(tempPath); } catch { /* cleanupTempImports() sweeps any haven-import leftover */ }
-
-    res.json({ success: true, ...stats });
-  } catch (err) {
-    console.error('Import execute error:', err);
-    res.status(500).json({ error: 'Import failed: ' + err.message });
-  }
-});
 
 // ── Server templates: src/routes/serverTemplate.js ──
 require('./src/routes/serverTemplate')({ app, verifyAdminFromDb, uploadLimiter, uploadDiskGuard, THEMES_DIR, late });
@@ -3403,7 +3341,7 @@ initFerry({
   editHavenMessage: ({ havenMessageId, channelCode, content }) => {
     try {
       const info = db.prepare(
-        "UPDATE messages SET content = ?, edited_at = CURRENT_TIMESTAMP WHERE id = ? AND is_webhook = 1"
+        "UPDATE messages SET content = ?, edited_at = CURRENT_TIMESTAMP WHERE id = ? AND is_webhook = 1 AND is_archived = 0"
       ).run(content, havenMessageId);
       if (!info.changes) return;
 

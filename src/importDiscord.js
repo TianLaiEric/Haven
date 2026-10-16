@@ -195,9 +195,9 @@ function buildDCEResult(data) {
       timestamp: msg.timestamp,
       isPinned: msg.isPinned || false,
       reactions: (msg.reactions || []).map(r => ({
-        emoji: typeof r.emoji === 'string' ? r.emoji : (r.emoji?.name || '❓'),
+        emoji: importedReactionEmoji(r.emoji),
         count: r.count || 1
-      })),
+      })).filter(r => isReactionEmoji(r.emoji)),
       replyTo: msg.reference?.messageId || null
     });
   }
@@ -285,4 +285,21 @@ function splitCSVLine(line) {
   return fields;
 }
 
-module.exports = { parseDiscordExport };
+// Same rule the live add-reaction handler applies: a Unicode emoji or a
+// :custom_name:, at most 32 characters. Anything else is dropped on import.
+const REACTION_EMOJI_RE = /^[\p{Emoji}\p{Emoji_Component}️‍]+$/u;
+const CUSTOM_REACTION_RE = /^:[a-zA-Z0-9_-]{1,30}:$/;
+function isReactionEmoji(emoji) {
+  return typeof emoji === 'string' && emoji.length >= 1 && emoji.length <= 32
+    && (REACTION_EMOJI_RE.test(emoji) || CUSTOM_REACTION_RE.test(emoji));
+}
+
+// Discord exports name a server's own emoji bare ("pepe"). Haven writes those
+// as :pepe:, so they survive the check above instead of being dropped.
+function importedReactionEmoji(raw) {
+  const name = typeof raw === 'string' ? raw : (raw && typeof raw.name === 'string' ? raw.name : '');
+  if (/^[a-zA-Z0-9_-]{1,30}$/.test(name) && !REACTION_EMOJI_RE.test(name)) return `:${name}:`;
+  return name || '\u2753';
+}
+
+module.exports = { parseDiscordExport, isReactionEmoji, importedReactionEmoji };

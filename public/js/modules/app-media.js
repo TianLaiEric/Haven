@@ -196,6 +196,9 @@ _lightboxShow(imgEl, fallbackSrc = '') {
   const lbImg = document.getElementById('lightbox-img');
   if (!lbImg) return;
   const seq = (this._lightboxSeq = (this._lightboxSeq || 0) + 1);
+  this._imageZoomReset?.();
+  // A picture of a blog post shows its likes and dislikes (#5784).
+  this._forumPieceVotesLightbox?.(imgEl);
   if (this._lightboxBlobUrl) {
     try { URL.revokeObjectURL(this._lightboxBlobUrl); } catch { /* already gone */ }
     this._lightboxBlobUrl = null;
@@ -209,7 +212,9 @@ _lightboxShow(imgEl, fallbackSrc = '') {
     }).catch(() => { if (seq === this._lightboxSeq) lbImg.src = ''; });
     return;
   }
-  lbImg.src = imgEl ? imgEl.src : fallbackSrc;
+  // The real URL, not what the feed shows: a picture the lazy loader has not
+  // fetched yet, or has unloaded far off screen, holds a 1px blank.
+  lbImg.src = imgEl ? (this._lazyRealSrc(imgEl) || imgEl.src) : fallbackSrc;
 },
 
 _lightboxNavigate(dir) {
@@ -258,6 +263,8 @@ _closeLightbox() {
     this._lightboxBlobUrl = null;
   }
   this._lightboxIndex = -1;
+  this._imageZoomReset?.();
+  this._forumPieceVotesLightbox?.(null);
   this._hideImageContextMenu();
 },
 

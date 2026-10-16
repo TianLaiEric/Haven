@@ -55,7 +55,11 @@ function baseUrl(req) {
   //   'haven.example.com:8443'  → https://haven.example.com:8443
   // This is more reliable than extracting a port from the raw Host
   // header, which often carries an internal address (localhost:3000).
-  const isTrusted = req.app ? req.app.get('trust proxy') : false;
+  // Believe X-Forwarded-Host only from a peer the trust proxy setting trusts,
+  // the same rule req.ip follows. The setting being on is not enough: by
+  // default it trusts private addresses, and any LAN client has one.
+  const trustFn = req.app ? req.app.get('trust proxy fn') : null;
+  const isTrusted = typeof trustFn === 'function' && !!trustFn(req.socket?.remoteAddress || '', 0);
   if (isTrusted) {
     const fwdHost = req.get('X-Forwarded-Host');
     if (fwdHost) {
@@ -141,6 +145,80 @@ function finish(res, status, provider) {
 </script></body></html>`);
 }
 
+const PROVIDER_HOSTS = { steam: 'https://steamcommunity.com', spotify: 'https://accounts.spotify.com' };
+const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+/**
+ * The link token says which Haven account a link goes to, not who opened it.
+ * Someone could make a token for their own account and send the link to
+ * someone else, whose Steam or Spotify would then be linked to the sender's
+ * account (and their activity shown there). So the link opens on this page
+ * first: it names the Haven account, and nothing happens until the person
+ * clicks Continue. It cannot be framed, and the click must come from this page.
+ */
+function confirmPage(res, provider, token, username) {
+  const label = PROVIDER_LABELS[provider];
+  res.set('Cache-Control', 'no-store');
+  res.set('Content-Security-Policy',
+    `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${PROVIDER_HOSTS[provider]}; frame-ancestors 'none'; base-uri 'none'`);
+  res.set('X-Frame-Options', 'DENY');
+  res.type('html').send(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Link ${label}</title>
+<style>
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:#15161a; color:#e6e6e6;
+         font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  .card { text-align:center; padding:32px 40px; background:#1d1f24;
+          border:1px solid #2c2f36; border-radius:12px; max-width:420px; }
+  h1 { font-size:18px; margin:0 0 12px; }
+  p { font-size:13px; margin:0 0 18px; color:#a1a1aa; line-height:1.5; }
+  b { color:#e6e6e6; }
+  button { font:inherit; padding:8px 20px; border-radius:8px; border:0; background:#5865f2; color:#fff; cursor:pointer; }
+</style></head>
+<body><div class="card"><h1>Link ${label}</h1>
+<p>Your ${label} account will be linked to the Haven account <b>${escapeHtml(username)}</b>.
+Only continue if that is you and you started this from Haven.</p>
+<form method="post" action="/connect/${provider}/go"><input type="hidden" name="token" value="${escapeHtml(token)}"><button type="submit">Continue</button></form>
+</div></body></html>`);
+}
+
+// Spotify hands back listening data and tokens, so its link is also tied to
+// the browser that pressed Continue: otherwise someone could press Continue
+// themselves and send the provider's consent link on to someone else. Steam is
+// left out on purpose: its QR sign-in can finish in a different browser.
+const SPOTIFY_BIND_COOKIE = 'haven_spotify_bind';
+const _spotifyBinds = new Map(); // sha256(connect token) -> { bind, at }
+const _tokenKey = (token) => require('crypto').createHash('sha256').update(String(token)).digest('hex');
+function _bindCookie(req, value, maxAgeSec) {
+  const secure = req.secure || req.protocol === 'https';
+  return `${SPOTIFY_BIND_COOKIE}=${value}; Path=/connect/spotify; Max-Age=${maxAgeSec}; HttpOnly; SameSite=Lax${secure ? '; Secure' : ''}`;
+}
+function _cookieValue(req, name) {
+  for (const part of String(req.headers.cookie || '').split(';')) {
+    const [k, ...v] = part.trim().split('=');
+    if (k === name) return v.join('=');
+  }
+  return '';
+}
+function _takeSpotifyBind(req, token) {
+  const key = _tokenKey(token);
+  const entry = _spotifyBinds.get(key);
+  _spotifyBinds.delete(key);
+  if (!entry || Date.now() - entry.at > 10 * 60 * 1000) return false;
+  const got = _cookieValue(req, SPOTIFY_BIND_COOKIE);
+  return got.length === entry.bind.length
+    && require('crypto').timingSafeEqual(Buffer.from(got), Buffer.from(entry.bind));
+}
+
+/** True when the request came from a page on this server, not another site. */
+function fromThisSite(req) {
+  const site = req.get('Sec-Fetch-Site');
+  if (site) return site === 'same-origin';
+  const origin = req.get('Origin');
+  if (!origin) return false;
+  try { return new URL(origin).host === req.get('host'); } catch { return false; }
+}
+
 async function postForm(url, params, headers = {}) {
   const resp = await fetch(url, {
     method: 'POST',
@@ -170,8 +248,25 @@ function createConnectRoutes(getActivity) {
   // ══════════════════════════════════════════════════════
   // Steam: OpenID 2.0
   // ══════════════════════════════════════════════════════
-  router.get('/steam', (req, res) => {
+  const linkUsername = (userId) => {
+    const { getDb } = require('./database');
+    const u = getDb().prepare('SELECT username, display_name FROM users WHERE id = ?').get(userId);
+    return u ? (u.display_name && u.display_name !== u.username ? `${u.display_name} (${u.username})` : u.username) : '';
+  };
+  const showConfirm = (provider, configured) => (req, res) => {
+    if (!configured(req)) return res.status(503).send(`${PROVIDER_LABELS[provider]} integration not configured on this server`);
+    const userId = connectUserId(req.query.token, provider);
+    const username = userId ? linkUsername(userId) : '';
+    if (!username) return res.status(401).send('Link session expired. Close this tab and try again from Haven.');
+    confirmPage(res, provider, String(req.query.token), username);
+  };
+  router.get('/steam', showConfirm('steam', (req) => req.activity.isSteamConfigured()));
+  router.get('/spotify', showConfirm('spotify', (req) => req.activity.isSpotifyConfigured()));
+
+  router.post('/steam/go', express.urlencoded({ extended: false, limit: '4kb' }), (req, res) => {
     if (!req.activity.isSteamConfigured()) return res.status(503).send('Steam integration not configured on this server');
+    if (!fromThisSite(req)) return res.status(403).send('Open the link from Haven and press Continue.');
+    req.query.token = req.body && req.body.token;
     const userId = connectUserId(req.query.token, 'steam');
     if (!userId) return res.status(401).send('Link session expired. Close this tab and try again from Haven.');
 
@@ -187,7 +282,7 @@ function createConnectRoutes(getActivity) {
       'openid.identity': 'http://specs.openid.net/auth/2.0/identifier_select',
       'openid.claimed_id': 'http://specs.openid.net/auth/2.0/identifier_select',
     });
-    res.redirect(`https://steamcommunity.com/openid/login?${params}`);
+    res.redirect(303, `https://steamcommunity.com/openid/login?${params}`);
   });
 
   router.get('/steam/callback', async (req, res) => {
@@ -212,6 +307,17 @@ function createConnectRoutes(getActivity) {
       check['openid.mode'] = 'check_authentication';
 
       const returnToFromCheck = check['openid.return_to'] || '(missing)';
+      // Steam vouches that it signed the assertion, not that it was made for
+      // Haven. One made for another site, or for another link token, could be
+      // replayed here, so it must name this callback and this token, come
+      // from Steam's own endpoint, and claim the identity it asserts.
+      const expectedReturn = `${baseUrl(req)}/connect/steam/callback?token=${encodeURIComponent(req.query.token)}`;
+      if (check['openid.return_to'] !== expectedReturn
+          || check['openid.op_endpoint'] !== 'https://steamcommunity.com/openid/login'
+          || check['openid.claimed_id'] !== check['openid.identity']) {
+        console.error('[Haven activity] Steam callback: assertion was not made for this link');
+        return finish(res, 'error', 'steam');
+      }
 
       const resp = await postForm('https://steamcommunity.com/openid/login', check);
       const body = await resp.text();
@@ -266,10 +372,17 @@ function createConnectRoutes(getActivity) {
   // ══════════════════════════════════════════════════════
   // Spotify: OAuth 2.0 authorization code
   // ══════════════════════════════════════════════════════
-  router.get('/spotify', (req, res) => {
+  router.post('/spotify/go', express.urlencoded({ extended: false, limit: '4kb' }), (req, res) => {
     if (!req.activity.isSpotifyConfigured()) return res.status(503).send('Spotify integration not configured on this server');
+    if (!fromThisSite(req)) return res.status(403).send('Open the link from Haven and press Continue.');
+    req.query.token = req.body && req.body.token;
     const userId = connectUserId(req.query.token, 'spotify');
     if (!userId) return res.status(401).send('Link session expired. Close this tab and try again from Haven.');
+    const bind = require('crypto').randomBytes(32).toString('hex');
+    const now = Date.now();
+    for (const [k, v] of _spotifyBinds) if (now - v.at > 10 * 60 * 1000) _spotifyBinds.delete(k);
+    _spotifyBinds.set(_tokenKey(req.query.token), { bind, at: now });
+    res.set('Set-Cookie', _bindCookie(req, bind, 600));
 
     const params = new URLSearchParams({
       client_id: process.env.SPOTIFY_CLIENT_ID,
@@ -278,15 +391,21 @@ function createConnectRoutes(getActivity) {
       scope: SPOTIFY_SCOPES,
       // The signed connect token doubles as the CSRF state value.
       state: req.query.token,
-      show_dialog: 'false',
+      show_dialog: 'true',
     });
-    res.redirect(`https://accounts.spotify.com/authorize?${params}`);
+    res.redirect(303, `https://accounts.spotify.com/authorize?${params}`);
   });
 
   router.get('/spotify/callback', async (req, res) => {
     if (!req.activity.isSpotifyConfigured()) return finish(res, 'error', 'spotify');
     const userId = connectUserId(req.query.state, 'spotify');
     if (!userId) return finish(res, 'error', 'spotify');
+    const sameBrowser = _takeSpotifyBind(req, req.query.state);
+    res.set('Set-Cookie', _bindCookie(req, '', 0));
+    if (!sameBrowser) {
+      console.warn('[Haven activity] Spotify callback from a different browser than the one that started the link');
+      return finish(res, 'error', 'spotify');
+    }
     if (req.query.error || !req.query.code) return finish(res, 'error', 'spotify');
 
     try {

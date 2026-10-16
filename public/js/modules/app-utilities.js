@@ -388,9 +388,12 @@ _isImageUrl(str) {
 // strings arrive as `?ex=…&amp;is=…`. Feed those straight to the media proxy
 // and Discord (Ferry attachments) 404s. The phone client never HTML-escapes
 // the URL, which is why the same photo shows on mobile and vanishes on desktop.
+// A control character means a renderer placeholder (colour, timestamp) ended
+// up inside the URL; restoring it there would put markup into the href.
 _rawHttpUrl(escapedOrRaw) {
   if (typeof escapedOrRaw !== 'string' || !escapedOrRaw) return null;
   const decoded = this._decodeHtmlEntities(escapedOrRaw).replace(/['"<>]/g, '');
+  if (/[\u0000-\u001F\u007F]/.test(decoded)) return null;
   try { new URL(decoded); } catch { return null; }
   return decoded;
 },
@@ -516,7 +519,13 @@ _discordEmoteHtml(name, id, animated) {
   const label = this._escapeHtml(`:${name}:`);
   const own = this._findNamedEmoji(name);
   if (own) return `<img src="${this._escapeHtml(own.url)}" alt="${label}" title="${label}" class="custom-emoji">`;
-  return `<img src="/api/ferry/emote/${id}.${animated ? 'gif' : 'png'}" alt="${label}" title="${label}" class="custom-emoji discord-emote">`;
+  // The emote cache answers only holders of a media token. Until it arrives the
+  // address waits in data-emote-src, and _flushPendingMedia fills it in.
+  const path = `/api/ferry/emote/${encodeURIComponent(id)}.${animated ? 'gif' : 'png'}`;
+  const src = this._mediaToken
+    ? `src="${path}?mt=${encodeURIComponent(this._mediaToken)}"`
+    : `data-emote-src="${path}"`;
+  return `<img ${src} alt="${label}" title="${label}" class="custom-emoji discord-emote">`;
 },
 
 // Resolve a `:name:` shortcode to an image emoji. Checks the bundled
@@ -1232,7 +1241,8 @@ _refreshMediaToken() {
 _startMediaTokenRefresh() {
   if (this._mediaTokenTimer) return;
   this._mediaTokenTimer = setInterval(() => {
-    if (this._mediaProxyEnabled !== false) this._refreshMediaToken();
+    // Refreshed with the proxy off too: Discord emotes need the token.
+    this._refreshMediaToken();
   }, 6 * 60 * 60 * 1000);
 },
 
@@ -1262,18 +1272,26 @@ _setupMediaTokenRetry() {
   }, true);
 },
 
-// Returns a URL safe to put in a src attribute, or null when proxying is on
-// but the token has not arrived yet (caller must defer).
+// Returns a URL safe to put in a src attribute, '' when the URL must not be
+// loaded at all, or null when proxying is on but the token has not arrived
+// yet (caller must defer).
+// The URL is resolved the way the browser would resolve it, so spellings
+// like //host/x.png, /\host/x.png or https:\\host/x.png, which the browser
+// sends to another host, are proxied like any other remote URL.
 _proxyMediaUrl(url) {
   if (typeof url !== 'string' || !url) return url;
-  // Local paths, data: URIs and blobs never leave the origin.
-  if (!/^https?:\/\//i.test(url)) return url;
-  if (this._mediaProxyEnabled === false) return url;
-  try {
-    if (new URL(url, location.href).origin === location.origin) return url;
-  } catch { return url; }
+  let u;
+  try { u = new URL(url, location.href); } catch (err) {
+    console.warn('[media] dropped unreadable media URL:', err.message);
+    return '';
+  }
+  // data: URIs and blobs never leave the browser; same-origin paths stay local.
+  if (u.protocol === 'data:' || u.protocol === 'blob:') return url;
+  if (u.origin === location.origin) return url;
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+  if (this._mediaProxyEnabled === false) return u.href;
   if (!this._mediaToken) return null;   // enabled but not ready, so defer
-  return `/api/media-proxy?url=${encodeURIComponent(url)}&mt=${encodeURIComponent(this._mediaToken)}`;
+  return `/api/media-proxy?url=${encodeURIComponent(u.href)}&mt=${encodeURIComponent(this._mediaToken)}`;
 },
 
 // Builds the src attribute for an <img>, deferring when necessary. Returns an
@@ -1283,10 +1301,34 @@ _proxyMediaUrl(url) {
 // always points back at us. (#5483)
 _imgSrcAttr(url) {
   const p = this._proxyMediaUrl(url);
-  const origin = /^https?:\/\//i.test(url || '') ? ` data-mp-origin="${this._escapeHtml(url)}"` : '';
+  let remote = '';
+  if (typeof url === 'string' && url) {
+    try {
+      const u = new URL(url, location.href);
+      if (u.origin !== location.origin && /^https?:$/.test(u.protocol)) remote = u.href;
+    } catch { /* unreadable URL: _proxyMediaUrl already dropped it */ }
+  }
+  const origin = remote ? ` data-mp-origin="${this._escapeHtml(remote)}"` : '';
   return (p !== null
     ? `src="${this._escapeHtml(p)}"`
     : `data-mp-src="${this._escapeHtml(url)}"`) + origin;
+},
+
+// The src attribute for a bot or webhook avatar, whose URL its owner can set
+// to anything. Local ones must be uploads; remote ones go through the media
+// proxy so viewers never fetch them directly. '' means show the placeholder.
+_botAvatarSrcAttr(url) {
+  if (typeof url !== 'string' || !url) return '';
+  let u;
+  try { u = new URL(url, location.href); } catch (err) {
+    console.warn('[media] unreadable bot avatar URL:', err.message);
+    return '';
+  }
+  if (u.origin === location.origin) {
+    return u.pathname.startsWith('/uploads/') ? `src="${this._escapeHtml(url)}"` : '';
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+  return this._imgSrcAttr(url);
 },
 
 // Fill in any images that rendered before the token was available.
@@ -1297,6 +1339,12 @@ _flushPendingMedia() {
     if (p === null) return;            // still not ready
     el.removeAttribute('data-mp-src');
     el.setAttribute('src', p);
+  });
+  if (!this._mediaToken) return;
+  document.querySelectorAll('img[data-emote-src]').forEach(el => {
+    const path = el.getAttribute('data-emote-src');
+    el.removeAttribute('data-emote-src');
+    if (path.startsWith('/api/ferry/emote/')) el.setAttribute('src', `${path}?mt=${encodeURIComponent(this._mediaToken)}`);
   });
 },
 

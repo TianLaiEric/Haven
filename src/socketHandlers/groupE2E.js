@@ -10,12 +10,45 @@
  *   - epochs are append-only and strictly sequential
  *   - a member reads only their own wrapped blob
  */
-const { isInt } = require('./helpers');
+const { isInt, NEW_DMS_PER_HOUR } = require('./helpers');
 
 const { clearChannelRuntimeState } = require('../channelRotation');
+const { CONVERSATION_REFUSAL } = require('../protectedMessages');
 module.exports = function register(socket, ctx) {
   ctx.leaveGroupDm = (code, userId, attachments) => { const ch = groupOf(code); if (ch && isMember(ch.id, userId)) { leaveGroup(ch, userId, attachments); return true; } return false; };
   const { io, db, generateUniqueSharedCode } = ctx;
+  const { refuseYoungAccount } = require('./postingWait')(socket, ctx);
+
+  // Group invites a member may send per hour, by call. A group invite lands
+  // in other people's lists the same as a new DM, so it gets the DM cap.
+  // Kept in memory: an invite row is gone once it is answered.
+  if (!ctx.state.groupInviteLog) ctx.state.groupInviteLog = new Map();
+  const inviteLog = ctx.state.groupInviteLog;
+  function overInviteCap() {
+    if (socket.user.isAdmin) return false;
+    const now = Date.now();
+    const recent = (inviteLog.get(socket.user.id) || []).filter(t => now - t < 3600000);
+    if (recent.length >= NEW_DMS_PER_HOUR) { inviteLog.set(socket.user.id, recent); return true; }
+    recent.push(now);
+    inviteLog.set(socket.user.id, recent);
+    return false;
+  }
+  // New groups this member started in the last hour, against the same cap.
+  // Any error refuses.
+  function overGroupCap() {
+    if (socket.user.isAdmin) return false;
+    try {
+      const n = db.prepare(`
+        SELECT COUNT(*) AS n FROM channels
+        WHERE created_by = ? AND is_dm = 1 AND COALESCE(is_group, 0) = 1
+          AND created_at >= datetime('now', '-1 hour')
+      `).get(socket.user.id).n;
+      return n >= NEW_DMS_PER_HOUR;
+    } catch (err) {
+      console.warn('[groups] could not count new groups, refusing:', err.message);
+      return true;
+    }
+  }
 
   const memberIds = (channelId) =>
     db.prepare('SELECT user_id FROM channel_members WHERE channel_id = ? ORDER BY user_id').all(channelId).map((r) => r.user_id);
@@ -59,16 +92,24 @@ module.exports = function register(socket, ctx) {
     }
   };
 
-  const findExistingGroup = (want) => {
+  const findExistingGroup = (want, requesterId) => {
     const target = [...want].sort((a, b) => a - b);
+    // Only groups the requester is in or invited to: the roster asked for
+    // always includes them, and scanning every group on the server made each
+    // call cost more as groups piled up.
     const candidates = db.prepare(`
       SELECT c.id, c.code, c.name FROM channels c
       WHERE c.is_dm = 1
         AND (
+          EXISTS (SELECT 1 FROM channel_members WHERE channel_id = c.id AND user_id = ?)
+          OR EXISTS (SELECT 1 FROM dm_group_invites WHERE channel_id = c.id AND user_id = ?)
+        )
+        AND (
           (SELECT COUNT(*) FROM channel_members WHERE channel_id = c.id) >= 3
           OR EXISTS (SELECT 1 FROM dm_group_invites WHERE channel_id = c.id)
         )
-    `).all();
+      LIMIT 500
+    `).all(requesterId, requesterId);
     return candidates.find((c) => sameIds(rosterIds(c.id), target)) || null;
   };
 
@@ -175,7 +216,7 @@ module.exports = function register(socket, ctx) {
       return socket.emit('error-msg', `Cannot start an encrypted group with ${unusable.map((u) => u.username).join(', ')}: no encryption key published yet`);
     }
 
-    const existing = findExistingGroup(ids);
+    const existing = findExistingGroup(ids, socket.user.id);
     if (existing) {
       const payload = { ...groupPayload(existing), existing: true };
       if (isMember(existing.id, socket.user.id)) {
@@ -186,6 +227,11 @@ module.exports = function register(socket, ctx) {
       }
       return;
     }
+
+    // A new group reaches its invitees like a new DM does, so the same wait
+    // for new accounts and the same hourly cap apply.
+    if (refuseYoungAccount(null)) return;
+    if (overGroupCap()) return socket.emit('error-msg', 'You have started a lot of new conversations in the last hour. Try again later.');
 
     const invitees = ids.filter((id) => id !== socket.user.id);
     const name = typeof data.name === 'string' && data.name.trim() ? data.name.trim().slice(0, 50) : 'Group DM';
@@ -285,6 +331,8 @@ module.exports = function register(socket, ctx) {
     const ids = [...new Set((Array.isArray(data.userIds) ? data.userIds : []).filter(isInt))].filter((id) => !current.includes(id));
     if (!ids.length) return;
     if (current.length + ids.length > 50) return socket.emit('error-msg', 'Group DMs are limited to 50 people');
+    if (refuseYoungAccount(null)) return;
+    if (overInviteCap()) return socket.emit('error-msg', 'You have sent a lot of group invites in the last hour. Try again later.');
     const ph = ids.map(() => '?').join(',');
     const users = db.prepare(`SELECT u.id, u.public_key, u.signing_key, u.is_guest, COALESCE(u.display_name, u.username) AS username FROM users u LEFT JOIN bans b ON u.id = b.user_id WHERE u.id IN (${ph}) AND b.id IS NULL`).all(...ids);
     if (users.length !== ids.length) return socket.emit('error-msg', 'One or more users were not found');
@@ -303,14 +351,17 @@ module.exports = function register(socket, ctx) {
       db.prepare('DELETE FROM dm_group_invites WHERE channel_id = ? AND user_id = ?').run(ch.id, userId);
       db.prepare('DELETE FROM dm_group_rewrap_requests WHERE channel_id = ? AND requester_id = ?').run(ch.id, userId);
     })();
+    // Out of the group's call too: leaving the group is leaving its call.
+    ctx.liveAccess?.dropFromVoice(userId, [ch.code], 'You are no longer in this group');
     for (const s of socketsOf([userId])) { s.leave(`channel:${ch.code}`); s.emit('channel-deleted', { code: ch.code }); s.emit('group-dm-left', { code: ch.code }); }
     const left = memberIds(ch.id);
     if (!left.length) {
       // Only the last member's own uploads are released. Earlier members'
       // files may still be linked from encrypted messages elsewhere, which the
-      // server cannot read to check.
-      ctx.purgeDmChannel(ch, attachments, [userId]);
-      clearChannelRuntimeState(ctx.state, ch.code);
+      // server cannot read to check. A group holding protected messages is
+      // kept; the auto-cleanup sweep clears the rest of it.
+      if (ctx.purgeDmChannel(ch, attachments, [userId])) clearChannelRuntimeState(ctx.state, ch.code);
+      else console.log(`[protected] Kept group DM "${ch.code}" after its last member left: it holds protected messages`);
     } else {
       const user = db.prepare('SELECT COALESCE(display_name, username) AS username FROM users WHERE id = ?').get(userId);
       io.to(`channel:${ch.code}`).emit('group-dm-member-left', { code: ch.code, user: { id: userId, username: user && user.username }, members: groupPayload(ch).members });
@@ -364,7 +415,9 @@ module.exports = function register(socket, ctx) {
     // Every member's own uploads go with it. Encrypted files the members sent
     // are also released by the messages they were attached to (#5699); the
     // list from the admin's app covers files from before that.
-    ctx.purgeDmChannel(ch, Array.isArray(attachments) ? attachments : []);
+    if (!ctx.purgeDmChannel(ch, Array.isArray(attachments) ? attachments : [])) {
+      return void socket.emit('error-msg', CONVERSATION_REFUSAL);
+    }
     clearChannelRuntimeState(ctx.state, ch.code);
     // group-dm-deleted goes first, while their app still knows the group's
     // name; channel-deleted then removes it, the pop-out DM window included.

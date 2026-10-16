@@ -2,9 +2,11 @@
 
 const path = require('path');
 const fs   = require('fs');
-const { utcStamp, isString, isInt, sanitizeText, isValidUploadPath, normalizeDisplayName, sanitizeBorderTransform, parseBorderTransform } = require('./helpers');
+const { utcStamp, isString, sanitizeText, isValidUploadPath, normalizeDisplayName, sanitizeBorderTransform, parseBorderTransform } = require('./helpers');
 const { generateConnectToken } = require('../auth');
 const { setEnvValue, clearEnvValue, isWritableKey } = require('../envStore');
+const { saveFcmToken } = require('../fcm');
+const { validHighScore, isKnownGame } = require('../highScores');
 
 // A personal sidebar order (#5779): category keys and, per category, channel
 // codes. Only that shape is kept, within limits, so the value cannot carry
@@ -24,6 +26,17 @@ function cleanChannelOrder(raw) {
   }
   const out = JSON.stringify({ cats, ch });
   return out.length <= 20000 ? out : null;
+}
+
+// A real calendar date from 1900 up to today as YYYY-MM-DD, else null. A day
+// of slack lets someone whose local date is ahead of UTC pick their today.
+function cleanBirthday(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const [y, m, d] = value.split('-').map(Number);
+  const date = new Date(Date.UTC(y, m - 1, d));
+  if (date.getUTCMonth() !== m - 1 || date.getUTCDate() !== d) return null;
+  if (y < 1900 || date.getTime() > Date.now() + 86400000) return null;
+  return value;
 }
 
 module.exports = function register(socket, ctx) {
@@ -281,7 +294,9 @@ module.exports = function register(socket, ctx) {
     try {
       const row = db.prepare(
         `SELECT u.id, u.username, COALESCE(u.display_name, u.username) as displayName,
-                u.avatar, u.avatar_shape, u.border, u.border_transform, u.animate_profile, u.status, u.status_text, u.bio, u.created_at
+                u.avatar, u.avatar_shape, u.border, u.border_transform, u.animate_profile, u.status, u.status_text, u.bio, u.created_at,
+                CASE WHEN u.birthday_hidden <> 0 OR u.birthday_hidden IS NULL THEN NULL
+                     WHEN u.birthday_hide_year = 0 THEN u.birthday ELSE substr(u.birthday, 6) END as birthday
          FROM users u WHERE u.id = ?`
       ).get(data.userId);
       if (!row) return;
@@ -348,6 +363,9 @@ module.exports = function register(socket, ctx) {
         status: hidden ? 'offline' : (row.status || 'online'),
         statusText: row.status_text || '',
         bio: row.bio || '',
+        // MM-DD, or YYYY-MM-DD when the owner turned off Hide birth year;
+        // null while they hide their birthday.
+        birthday: row.birthday || null,
         roles: roles,
         online: isOnline,
         createdAt: row.created_at,
@@ -372,6 +390,56 @@ module.exports = function register(socket, ctx) {
     } catch (err) {
       console.error('Set bio error:', err);
     }
+  });
+
+  // A birthday is set once and can never be changed. Hiding it keeps the date
+  // and only takes it off the profile and member lists; Hide birth year
+  // changes whenever. `hidden` is optional: clients from before it existed
+  // send birthday null to hide, and a first date shows.
+  socket.on('set-birthday', (data) => {
+    if (!data || typeof data !== 'object') return;
+    let birthday = null;
+    if (data.birthday != null) {
+      birthday = cleanBirthday(data.birthday);
+      if (!birthday) return socket.emit('error-msg', 'Invalid birthday');
+    }
+    let listsChanged = false;
+    try {
+      const row = db.prepare('SELECT birthday, birthday_set_at, birthday_hide_year, birthday_hidden FROM users WHERE id = ?').get(socket.user.id);
+      if (!row) return;
+      if (row.birthday && birthday && birthday !== row.birthday) {
+        return socket.emit('error-msg', 'Your birthday can only be set once.');
+      }
+      const firstSet = !row.birthday && !!birthday;
+      const date = row.birthday || birthday;
+      const setAt = firstSet ? new Date().toISOString() : row.birthday_set_at;
+      // A missing or NULL flag counts as hidden, so privacy fails closed.
+      const wasHidden = row.birthday_hidden !== 0;
+      const hidden = typeof data.hidden === 'boolean' ? data.hidden
+        : data.birthday === null ? true
+        : firstSet ? false
+        : wasHidden;
+      const hideYear = typeof data.hideYear === 'boolean' ? data.hideYear : row.birthday_hide_year !== 0;
+      // Member lists only carry MM-DD, so Hide birth year alone leaves them be.
+      listsChanged = date !== row.birthday || hidden !== wasHidden;
+      if (!listsChanged && hideYear === (row.birthday_hide_year !== 0)) return;
+      db.prepare('UPDATE users SET birthday = ?, birthday_set_at = ?, birthday_hide_year = ?, birthday_hidden = ? WHERE id = ?')
+        .run(date, setAt, hideYear ? 1 : 0, hidden ? 1 : 0, socket.user.id);
+      socket.user.birthday = date;
+      socket.user.birthdaySetAt = setAt;
+      socket.user.birthdayHideYear = hideYear;
+      socket.user.birthdayHidden = hidden;
+      socket.emit('birthday-updated', { birthday: date, birthdaySetAt: setAt, birthdayHideYear: hideYear, birthdayHidden: hidden });
+    } catch (err) {
+      console.error('Set birthday error:', err);
+      return;
+    }
+    if (!listsChanged) return;
+    // Member lists carry the birthday, so a 🎉 shows (or goes) right away.
+    for (const [code, users] of channelUsers) {
+      if (users.has(socket.user.id)) emitOnlineUsers(code);
+    }
+    if (emitDmPresence) emitDmPresence(socket.user.id);
   });
 
   // ── Push Notifications ──────────────────────────────────
@@ -449,15 +517,9 @@ module.exports = function register(socket, ctx) {
       // endpoint dies on resubscribe and the 410 handler prunes it, but an FCM
       // token stays valid across an account switch, so a stale row never
       // cleans itself up.
-      const fcmToken = data.token.trim();
-      db.transaction(() => {
-        db.prepare('DELETE FROM fcm_tokens WHERE token = ? AND user_id != ?').run(fcmToken, socket.user.id);
-        db.prepare(`
-          INSERT INTO fcm_tokens (user_id, token)
-          VALUES (?, ?)
-          ON CONFLICT(user_id, token) DO NOTHING
-        `).run(socket.user.id, fcmToken);
-      })();
+      // saveFcmToken claims the token for this account and applies the
+      // length and per-account caps.
+      saveFcmToken(db, socket.user.id, data.token.trim());
     } catch (err) {
       console.error('FCM token register error:', err);
     }
@@ -644,7 +706,9 @@ module.exports = function register(socket, ctx) {
       'server_mute', 'muted_users',
     ];
     // 'effects' is a JSON array of effect ids, longer than the other values.
-    const maxLen = key === 'effects' ? 400 : key === 'channel_order' ? 20000 : key === 'muted_users' ? 6000 : 50;
+    // A theme is saved as file:<file name>, and a community theme's file name
+    // can run long; at 50 it was dropped without a word and lost on reload.
+    const maxLen = key === 'effects' ? 400 : key === 'channel_order' ? 20000 : key === 'muted_users' ? 6000 : key === 'theme' ? 200 : 50;
     if (!allowedKeys.includes(key) || !value || value.length > maxLen) return;
     let stored = value;
     if (key === 'channel_order') {
@@ -918,14 +982,18 @@ module.exports = function register(socket, ctx) {
   socket.on('submit-high-score', (data) => {
     if (!data || typeof data !== 'object') return;
     const game = typeof data.game === 'string' ? data.game.trim() : '';
-    const score = isInt(data.score) && data.score >= 0 ? data.score : 0;
     if (!game || !/^[a-z0-9_-]{1,32}$/.test(game)) return;
+    if (!isKnownGame(game)) return;
+    // Same rule as POST /api/high-scores: a safe integer under the game's ceiling.
+    const score = validHighScore(game, data.score);
+    if (score === null) return;
 
     const current = db.prepare(
       'SELECT score FROM high_scores WHERE user_id = ? AND game = ?'
     ).get(socket.user.id, game);
 
-    if (!current || score > current.score) {
+    const improved = !current || score > current.score;
+    if (improved) {
       db.prepare(
         'INSERT OR REPLACE INTO high_scores (user_id, game, score, updated_at) VALUES (?, ?, ?, datetime(\'now\'))'
       ).run(socket.user.id, game, score);
@@ -950,7 +1018,9 @@ module.exports = function register(socket, ctx) {
         )
       ORDER BY hs.score DESC LIMIT 50
     `).all(game);
-    io.except('bot-sockets').emit('high-scores', { game, leaderboard });
+    // Everyone hears about a new best; an unchanged board goes only to the
+    // sender, so repeating a score is not a broadcast to the whole server.
+    (improved ? io.except('bot-sockets') : socket).emit('high-scores', { game, leaderboard });
   });
 
   socket.on('get-high-scores', (data) => {
@@ -992,6 +1062,14 @@ module.exports = function register(socket, ctx) {
 
       if (signups.some(s => s.email === email)) {
         return callback({ ok: true });
+      }
+      // One entry per account, and a ceiling on the file: it is read and
+      // rewritten whole on each signup.
+      if (signups.some(s => s.username === socket.user.username)) {
+        return callback({ ok: false, error: 'You are already signed up.' });
+      }
+      if (signups.length >= 5000) {
+        return callback({ ok: false, error: 'The beta list is full.' });
       }
 
       signups.push({

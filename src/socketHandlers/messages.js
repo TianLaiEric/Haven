@@ -7,11 +7,12 @@ const { utcStamp, isString, isInt, sanitizeText, parseBorderTransform, toReplyCo
 const { getActiveTokenizer, minQueryChars, buildMatchQuery } = require('../searchIndex');
 const selfDestruct = require('../selfDestruct');
 const { applyTagsToMessage, setMessageTags, normalizeTagName, escapeLike, extractUploadPath, effectiveLimits } = require('../uploadTags');
-const { votesFor } = require('../forumVotes');
+const { votesFor, pieceVotesFor } = require('../forumVotes');
 const forumBlog = require('../forumBlog');
 const highlights = require('../messageHighlights');
 const quotes = require('../messageQuotes');
 const forumUnread = require('../forumUnread');
+const protectedMessages = require('../protectedMessages');
 
 // The length limit is on what people type. An encrypted DM reaches the
 // server as ciphertext: AES-GCM output in base64 inside a small JSON wrapper,
@@ -58,6 +59,30 @@ module.exports = function register(socket, ctx) {
     if ((u && u.is_admin) || userHasPermission(userId, 'mention_everyone', channelId)) return content;
     const out = content.replace(/(?<![\w@])@(everyone|here)\b/gi, '@\u200B$1');
     return stripRoleMentions(out, db.prepare('SELECT name FROM roles').all().map(r => r.name));
+  }
+
+  // Slow mode for posts other than send-message (thread replies, polls),
+  // sharing its clock. Returns the refusal text, or null and counts the post.
+  function slowModeRefusal(channelId) {
+    if (socket.user.isAdmin) return null;
+    const row = db.prepare('SELECT slow_mode_interval FROM channels WHERE id = ?').get(channelId);
+    if (!row || !(row.slow_mode_interval > 0)) return null;
+    if (getUserEffectiveLevel(socket.user.id, channelId) >= 25) return null;
+    const key = `slow:${socket.user.id}:${channelId}`;
+    const now = Date.now();
+    const waitMs = row.slow_mode_interval * 1000;
+    const last = slowModeTracker.get(key) || 0;
+    if (now - last < waitMs) return `Slow mode: wait ${Math.ceil((waitMs - (now - last)) / 1000)}s before sending another message`;
+    slowModeTracker.set(key, now);
+    return null;
+  }
+
+  // In a DM only its members; elsewhere the admin, or someone the gate lets in.
+  function canTouchChannel(channelId) {
+    const ch = db.prepare('SELECT is_dm FROM channels WHERE id = ?').get(channelId);
+    if (!ch) return false;
+    if (socket.user.isAdmin && !ch.is_dm) return true;
+    return hasChannelAccess(channelId);
   }
 
   function hasChannelAccess(channelId) {
@@ -113,6 +138,32 @@ module.exports = function register(socket, ctx) {
       let m;
       while ((m = UPLOAD_PATH_RE.exec(r.content || '')) !== null) rels.push(m[1]);
       for (const rel of releasableUploads(db, rels, [r.user_id])) moveUploadToDeleted(rel);
+    }
+  }
+
+  // A poll's votes as one person sees them. In an anonymous poll, everyone
+  // else's vote is a blank entry: the counts stay right and your own vote
+  // still shows as yours, but no names or ids leave the server. Only the
+  // page used to hide them.
+  function pollVotesView(poll, votes, viewerId) {
+    const out = {};
+    poll.options.forEach((_, i) => { out[i] = []; });
+    for (const v of votes) {
+      if (!out[v.option_index]) out[v.option_index] = [];
+      out[v.option_index].push(poll.anonymous && v.user_id !== viewerId
+        ? { user_id: 0, username: '' }
+        : { user_id: v.user_id, username: v.username });
+    }
+    return out;
+  }
+  function emitPollUpdate(code, messageId, poll, votes) {
+    const base = { channelCode: code, messageId, totalVotes: votes.length };
+    if (!poll.anonymous) {
+      io.to(`channel:${code}`).emit('poll-updated', { ...base, votes: pollVotesView(poll, votes, null) });
+      return;
+    }
+    for (const [, s] of io.sockets.sockets) {
+      if (s.user && s.rooms.has(`channel:${code}`)) s.emit('poll-updated', { ...base, votes: pollVotesView(poll, votes, s.user.id) });
     }
   }
 
@@ -221,13 +272,14 @@ module.exports = function register(socket, ctx) {
     const tags = Array.isArray(data.tags) ? data.tags.filter(t => typeof t === 'string' && t.trim()).map(t => t.trim().slice(0, 30)).slice(0, 10) : [];
     const tagMode = data.tagMode === 'all' ? 'all' : 'some';
 
-    const channel = db.prepare('SELECT id, is_forum, role_gate, forum_blog FROM channels WHERE code = ?').get(code);
+    const channel = db.prepare('SELECT id, is_forum, role_gate, forum_blog, is_dm FROM channels WHERE code = ?').get(code);
     if (!channel) return;
 
     const member = db.prepare(
       'SELECT 1 FROM channel_members WHERE channel_id = ? AND user_id = ?'
     ).get(channel.id, socket.user.id);
-    if (!member && !socket.user.isAdmin) return socket.emit('error-msg', 'Not a member of this channel');
+    // Being the admin is no key to other people's DMs.
+    if (!member && (!socket.user.isAdmin || channel.is_dm)) return socket.emit('error-msg', 'Not a member of this channel');
     if (!socket.user.isAdmin && !ctx.roleGateAllows(socket.user.id, channel)) return socket.emit('error-msg', 'This channel needs a role you do not hold');
 
     let messages;
@@ -459,12 +511,7 @@ module.exports = function register(socket, ctx) {
         try {
           obj.poll = JSON.parse(m.poll_data);
           const votes = pollVoteMap.get(m.id) || [];
-          obj.poll.votes = {};
-          obj.poll.options.forEach((_, i) => { obj.poll.votes[i] = []; });
-          votes.forEach(v => {
-            if (!obj.poll.votes[v.option_index]) obj.poll.votes[v.option_index] = [];
-            obj.poll.votes[v.option_index].push({ user_id: v.user_id, username: v.username });
-          });
+          obj.poll.votes = pollVotesView(obj.poll, votes, socket.user.id);
           obj.poll.totalVotes = votes.length;
         } catch (e) { /* invalid poll_data: send the message without its poll rather than drop it */ }
       }
@@ -729,11 +776,11 @@ module.exports = function register(socket, ctx) {
     const code = typeof data.code === 'string' ? data.code.trim() : '';
     if (!code || !/^[a-f0-9]{8}$/i.test(code)) return;
 
-    const channel = db.prepare('SELECT id FROM channels WHERE code = ?').get(code);
+    const channel = db.prepare('SELECT id, is_dm FROM channels WHERE code = ?').get(code);
     if (!channel) return;
 
     const member = hasChannelAccess(channel.id);
-    if (!member && !socket.user.isAdmin) {
+    if (!member && (!socket.user.isAdmin || channel.is_dm)) {
       return socket.emit('error-msg', 'Not a member of this channel');
     }
 
@@ -901,11 +948,11 @@ module.exports = function register(socket, ctx) {
     const code = typeof data.code === 'string' ? data.code.trim() : '';
     if (!code || !/^[a-f0-9]{8}$/i.test(code)) return;
 
-    const channel = db.prepare('SELECT id FROM channels WHERE code = ?').get(code);
+    const channel = db.prepare('SELECT id, is_dm FROM channels WHERE code = ?').get(code);
     if (!channel) return;
 
     const member = hasChannelAccess(channel.id);
-    if (!member && !socket.user.isAdmin) {
+    if (!member && (!socket.user.isAdmin || channel.is_dm)) {
       return socket.emit('error-msg', 'Not a member of this channel');
     }
 
@@ -961,13 +1008,14 @@ module.exports = function register(socket, ctx) {
     const channel = db.prepare('SELECT id, is_dm FROM channels WHERE code = ?').get(code);
     if (!channel) return cb({ error: 'Channel not found' });
 
-    const member = db.prepare(
-      'SELECT 1 FROM channel_members WHERE channel_id = ? AND user_id = ?'
-    ).get(channel.id, socket.user.id);
-    if (!member && !socket.user.isAdmin) return cb({ error: 'Not a member' });
+    // In a channel, the people its gate lets in (and the admin). In a DM, only
+    // its two people, and each only their own messages: a server-wide delete
+    // permission, or being the admin, is not a key to other people's DMs.
+    const canReach = channel.is_dm ? hasChannelAccess(channel.id) : (socket.user.isAdmin || hasChannelAccess(channel.id));
+    if (!canReach) return cb({ error: 'Not a member' });
 
-    const canDeleteAny  = socket.user.isAdmin || userHasPermission(socket.user.id, 'delete_message', channel.id);
-    const canDeleteLowr = !canDeleteAny && userHasPermission(socket.user.id, 'delete_lower_messages', channel.id);
+    const canDeleteAny  = !channel.is_dm && (socket.user.isAdmin || userHasPermission(socket.user.id, 'delete_message', channel.id));
+    const canDeleteLowr = !channel.is_dm && !canDeleteAny && userHasPermission(socket.user.id, 'delete_lower_messages', channel.id);
     const myLevel = (!canDeleteAny && canDeleteLowr) ? getUserEffectiveLevel(socket.user.id, channel.id) : 0;
 
     // Allow self-delete fallback only if the policy allows it. Mirrors
@@ -991,12 +1039,16 @@ module.exports = function register(socket, ctx) {
 
     const placeholders = ids.map(() => '?').join(',');
     const rows = db.prepare(
-      `SELECT id, user_id, content FROM messages WHERE channel_id = ? AND id IN (${placeholders})`
+      `SELECT m.id, m.user_id, m.content, ${protectedMessages.keptSql('m')} AS kept
+       FROM messages m WHERE m.channel_id = ? AND m.id IN (${placeholders})`
     ).all(channel.id, ...ids);
 
     const deletable = [];
     const skipped = [];
+    let kept = 0;
     for (const r of rows) {
+      // Protected messages stay, and so does a thread head holding one.
+      if (r.kept) { skipped.push(r.id); kept++; continue; }
       let ok = false;
       if (r.user_id === socket.user.id) {
         ok = allowOwnDelete;
@@ -1011,7 +1063,8 @@ module.exports = function register(socket, ctx) {
     }
 
     if (deletable.length === 0) {
-      return cb({ error: 'You don\'t have permission to delete the selected items', deleted: 0, skipped: skipped.length });
+      if (kept && kept === rows.length) return cb({ error: protectedMessages.REFUSAL, deleted: 0, skipped: skipped.length, kept });
+      return cb({ error: 'You don\'t have permission to delete the selected items', deleted: 0, skipped: skipped.length, kept });
     }
 
     const delPin = db.prepare('DELETE FROM pinned_messages WHERE message_id = ?');
@@ -1065,7 +1118,7 @@ module.exports = function register(socket, ctx) {
       });
     }
 
-    cb({ success: true, deleted: deletable.length, skipped: skipped.length });
+    cb({ success: true, deleted: deletable.length, skipped: skipped.length, kept });
   };
 
   // ── Delete every message you wrote (#5686) ────────────────
@@ -1100,9 +1153,9 @@ module.exports = function register(socket, ctx) {
       const rows = db.prepare(`
         SELECT m.id, m.content, c.code, c.is_dm
         FROM messages m JOIN channels c ON c.id = m.channel_id
-        WHERE m.user_id = ? AND m.is_archived = 0
+        WHERE m.user_id = ? AND ${protectedMessages.deletableSql('m')}
       `).all(uid);
-      const kept = db.prepare('SELECT COUNT(*) AS n FROM messages WHERE user_id = ? AND is_archived = 1').get(uid).n;
+      const kept = db.prepare(`SELECT COUNT(*) AS n FROM messages m WHERE m.user_id = ? AND ${protectedMessages.keptSql('m')}`).get(uid).n;
       if (!rows.length) return cb({ success: true, deleted: 0, kept });
 
       // Reactions, votes, tags and thread replies follow through the foreign
@@ -1763,6 +1816,7 @@ module.exports = function register(socket, ctx) {
           WHERE m.burn_seconds > 0
             AND m.burning_started_at IS NOT NULL
             AND datetime(m.burning_started_at, '+' || m.burn_seconds || ' seconds') <= datetime('now')
+            AND ${protectedMessages.deletableSql('m')}
         `).all();
         for (const row of expired) {
           db.prepare('DELETE FROM messages WHERE id = ?').run(row.id);
@@ -1997,19 +2051,25 @@ module.exports = function register(socket, ctx) {
 
     const channel = db.prepare('SELECT id, is_dm, is_group FROM channels WHERE code = ?').get(code);
     if (!channel) return;
+    // Editing takes still being there: someone removed from a channel or a
+    // group could otherwise keep rewriting what they had posted in it.
+    if (!(socket.user.isAdmin && !channel.is_dm) && !hasChannelAccess(channel.id)) return;
     if (channel.is_group && !isGroupEnvelope(data.content)) return socket.emit('error-msg', 'Group messages must be end-to-end encrypted. Update Haven to send here.');
     if (data.content.length > contentCap(_editMax, channel, data.content)) {
       return socket.emit('error-msg', `Message too long (max ${_editMax} characters)`);
     }
 
     const msg = db.prepare(
-      'SELECT id, user_id FROM messages WHERE id = ? AND channel_id = ?'
+      'SELECT id, user_id, is_archived FROM messages WHERE id = ? AND channel_id = ?'
     ).get(data.messageId, channel.id);
     if (!msg) return;
 
     if (msg.user_id !== socket.user.id) {
       return socket.emit('error-msg', 'You can only edit your own messages');
     }
+    // A protected message is kept as it was, as a record; editing it would
+    // undo that as surely as deleting it.
+    if (msg.is_archived) return socket.emit('error-msg', 'This message is protected. Unprotect it first.');
     if (!socket.user.isAdmin && !userHasPermission(socket.user.id, 'edit_own_messages', channel.id)) {
       return socket.emit('error-msg', 'You don\'t have permission to edit messages');
     }
@@ -2067,11 +2127,16 @@ module.exports = function register(socket, ctx) {
     // someone else holds; anywhere else, a non-admin must be in the channel.
     const _inChannel = !!db.prepare('SELECT 1 FROM channel_members WHERE channel_id = ? AND user_id = ?').get(channel.id, socket.user.id);
     if (channel.is_dm ? !_inChannel : (!_inChannel && !socket.user.isAdmin)) return;
+    // A role-gated channel is out of reach for people its gate keeps out.
+    if (!channel.is_dm && !socket.user.isAdmin && !hasChannelAccess(channel.id)) return;
 
     const msg = db.prepare(
       'SELECT id, user_id, content, destruct_at FROM messages WHERE id = ? AND channel_id = ?'
     ).get(data.messageId, channel.id);
     if (!msg) return;
+    // Protected means kept, whoever asks, the admin included.
+    const kept = protectedMessages.refusal(db, msg.id);
+    if (kept) return socket.emit('error-msg', kept);
 
     if (msg.user_id === socket.user.id) {
       if (!socket.user.isAdmin) {
@@ -2092,6 +2157,8 @@ module.exports = function register(socket, ctx) {
         }
       }
     } else {
+      // In a DM each person deletes only their own messages.
+      if (channel.is_dm) return socket.emit('error-msg', 'You can only delete your own messages');
       const canDeleteAny = socket.user.isAdmin || userHasPermission(socket.user.id, 'delete_message', channel.id);
       let canDeleteLower = false;
       if (!canDeleteAny && userHasPermission(socket.user.id, 'delete_lower_messages', channel.id)) {
@@ -2228,6 +2295,9 @@ module.exports = function register(socket, ctx) {
 
     const channel = db.prepare('SELECT id FROM channels WHERE code = ?').get(code);
     if (!channel) return;
+    // currentChannel is where the person last was, not proof they still
+    // reach it: a gate, a role or going private can have taken it away.
+    if (!canTouchChannel(channel.id)) return;
 
     const msg = db.prepare(
       'SELECT id, destruct_at FROM messages WHERE id = ? AND channel_id = ?'
@@ -2283,6 +2353,9 @@ module.exports = function register(socket, ctx) {
 
     const channel = db.prepare('SELECT id FROM channels WHERE code = ?').get(code);
     if (!channel) return;
+    // currentChannel is where the person last was, not proof they still
+    // reach it: a gate, a role or going private can have taken it away.
+    if (!canTouchChannel(channel.id)) return;
 
     const pin = db.prepare(
       'SELECT id FROM pinned_messages WHERE message_id = ? AND channel_id = ?'
@@ -2318,15 +2391,18 @@ module.exports = function register(socket, ctx) {
 
     const channel = db.prepare('SELECT id FROM channels WHERE code = ?').get(code);
     if (!channel) return;
+    // currentChannel is where the person last was, not proof they still
+    // reach it: a gate, a role or going private can have taken it away.
+    if (!canTouchChannel(channel.id)) return;
 
     const msg = db.prepare('SELECT id, is_archived, destruct_at FROM messages WHERE id = ? AND channel_id = ?').get(data.messageId, channel.id);
     if (!msg) return socket.emit('error-msg', 'Message not found');
     if (msg.is_archived) return socket.emit('error-msg', 'Message is already archived');
 
     try {
-      // A protected message is kept, self-destruct timer included, the
-      // same as auto-cleanup and self-purge leave it alone.
-      db.prepare('UPDATE messages SET is_archived = 1, destruct_at = NULL WHERE id = ?').run(data.messageId);
+      // A protected message is kept: its self-destruct and burn-after-read
+      // timers stop, the same as auto-cleanup and self-purge leave it alone.
+      db.prepare('UPDATE messages SET is_archived = 1, destruct_at = NULL, burn_seconds = 0, burning_started_at = NULL WHERE id = ?').run(data.messageId);
       if (msg.destruct_at) selfDestruct.forget(msg.destruct_at);
     } catch (err) {
       console.error('Archive message error:', err);
@@ -2355,6 +2431,9 @@ module.exports = function register(socket, ctx) {
 
     const channel = db.prepare('SELECT id FROM channels WHERE code = ?').get(code);
     if (!channel) return;
+    // currentChannel is where the person last was, not proof they still
+    // reach it: a gate, a role or going private can have taken it away.
+    if (!canTouchChannel(channel.id)) return;
 
     const msg = db.prepare('SELECT id, is_archived FROM messages WHERE id = ? AND channel_id = ?').get(data.messageId, channel.id);
     if (!msg) return socket.emit('error-msg', 'Message not found');
@@ -2443,9 +2522,10 @@ module.exports = function register(socket, ctx) {
         if (reactMute) return socket.emit('error-msg', reactMute);
       }
 
-      // Verify membership of the channel the message lives in.
+      // Verify membership of the channel the message lives in. Being the
+      // admin is no key to other people's DMs.
       const member = hasChannelAccess(msg.channel_id);
-      if (!member && !socket.user.isAdmin) return;
+      if (!member && (!socket.user.isAdmin || msg.is_dm)) return;
       if (msg.reactions_enabled === 0) {
         return socket.emit('error-msg', 'Reactions are disabled in this channel');
       }
@@ -2486,13 +2566,13 @@ module.exports = function register(socket, ctx) {
 
       // Look up the channel from the message (see add-reaction comment).
       const msgRow = db.prepare(
-        'SELECT m.id, c.code, c.id as channel_id, c.reactions_enabled FROM messages m JOIN channels c ON m.channel_id = c.id WHERE m.id = ?'
+        'SELECT m.id, c.code, c.id as channel_id, c.is_dm, c.reactions_enabled FROM messages m JOIN channels c ON m.channel_id = c.id WHERE m.id = ?'
       ).get(data.messageId);
       if (!msgRow) return;
       const code = msgRow.code;
 
       const member = hasChannelAccess(msgRow.channel_id);
-      if (!member && !socket.user.isAdmin) return;
+      if (!member && (!socket.user.isAdmin || msgRow.is_dm)) return;
       if (msgRow.reactions_enabled === 0) {
         return socket.emit('error-msg', 'Reactions are disabled in this channel');
       }
@@ -2569,6 +2649,8 @@ module.exports = function register(socket, ctx) {
       }
       if (refuseYoungAccount(channel.id)) return;
       if (enforceAutomod([question, ...cleanOptions].join('\n'), { surface: 'message', channelId: channel.id })) return;
+      const pollSlow = slowModeRefusal(channel.id);
+      if (pollSlow) return socket.emit('error-msg', pollSlow);
       for (let i = 0; i < cleanOptions.length; i++) cleanOptions[i] = pingSafe(cleanOptions[i], socket.user.id, channel.id);
 
       const safeQuestion = sanitizeText(pingSafe(question, socket.user.id, channel.id));
@@ -2650,19 +2732,7 @@ module.exports = function register(socket, ctx) {
         WHERE pv.message_id = ? ORDER BY pv.id
       `).all(data.messageId);
 
-      const votesByOption = {};
-      poll.options.forEach((_, i) => { votesByOption[i] = []; });
-      votes.forEach(v => {
-        if (!votesByOption[v.option_index]) votesByOption[v.option_index] = [];
-        votesByOption[v.option_index].push({ user_id: v.user_id, username: v.username });
-      });
-
-      io.to(`channel:${code}`).emit('poll-updated', {
-        channelCode: code,
-        messageId: data.messageId,
-        votes: votesByOption,
-        totalVotes: votes.length
-      });
+      emitPollUpdate(code, data.messageId, poll, votes);
     } catch (err) {
       console.error('vote-poll error:', err.message);
     }
@@ -2694,19 +2764,7 @@ module.exports = function register(socket, ctx) {
         WHERE pv.message_id = ? ORDER BY pv.id
       `).all(data.messageId);
 
-      const votesByOption = {};
-      poll.options.forEach((_, i) => { votesByOption[i] = []; });
-      votes.forEach(v => {
-        if (!votesByOption[v.option_index]) votesByOption[v.option_index] = [];
-        votesByOption[v.option_index].push({ user_id: v.user_id, username: v.username });
-      });
-
-      io.to(`channel:${code}`).emit('poll-updated', {
-        channelCode: code,
-        messageId: data.messageId,
-        votes: votesByOption,
-        totalVotes: votes.length
-      });
+      emitPollUpdate(code, data.messageId, poll, votes);
     } catch (err) {
       console.error('unvote-poll error:', err.message);
     }
@@ -2983,6 +3041,8 @@ module.exports = function register(socket, ctx) {
       // post and the rest under Comments.
       blog: !!blogParts,
       blogPicsOnly: !!blogParts && forumBlog.picsOnly(db, channel.id),
+      // Each picture's likes and dislikes, and this reader's own vote (#5784).
+      pieceVotes: blogParts ? pieceVotesFor(db, socket.user.id, [parentId, ...blogParts]) : undefined,
       // A closed forum topic: only moderators and admins may still reply.
       closed: !!(parent.is_forum && parent.closed),
       parentContent: parent.content,
@@ -3049,14 +3109,24 @@ module.exports = function register(socket, ctx) {
       return socket.emit('error-msg', `You are in a timeout for ${remaining} more minute${remaining !== 1 ? 's' : ''}`);
     }
 
-    const tChannelRow = db.prepare('SELECT read_only FROM channels WHERE id = ?').get(channel.id);
+    const tChannelRow = db.prepare('SELECT read_only, text_enabled, media_enabled FROM channels WHERE id = ?').get(channel.id);
     if (tChannelRow && tChannelRow.read_only === 1 && !socket.user.isAdmin &&
         !userHasPermission(socket.user.id, 'read_only_override', channel.id)) {
       return socket.emit('error-msg', 'This channel is read-only');
     }
+    // The channel's text and media switches, as send-message applies them.
+    const tIsMedia = /^(?:spoiler-img:)?\/uploads\b/i.test(content) || /^\[file:[^\]]+\]\(/i.test(content);
+    if (tChannelRow && tChannelRow.text_enabled === 0 && (!tIsMedia || tChannelRow.media_enabled === 0)) {
+      return socket.emit('error-msg', 'Text messages are disabled in this channel');
+    }
+    if (tChannelRow && tChannelRow.media_enabled === 0 && tIsMedia && !socket.user.isAdmin) {
+      return socket.emit('error-msg', 'Media uploads are disabled in this channel');
+    }
 
     if (refuseYoungAccount(channel.id)) return;
     if (enforceAutomod(content, { surface: 'message', channelId: channel.id, markdown: true })) return;
+    const tSlow = slowModeRefusal(channel.id);
+    if (tSlow) return socket.emit('error-msg', tSlow);
 
     const safeContent = sanitizeText(pingSafe(content, socket.user.id, channel.id));
     if (!safeContent) return;

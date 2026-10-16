@@ -8,7 +8,9 @@ const fs = require('fs');
 const path = require('path');
 const multer = require('multer');
 const { DATA_DIR, DB_PATH, UPLOADS_DIR } = require('../paths');
-const { verifyToken } = require('../auth');
+const { verifyToken, authLimiter } = require('../auth');
+const express = require('express');
+const { checkAdminReauth, issueTicket, takeTicket } = require('../adminReauth');
 const { extractFullBackup } = require('../backupExtract');
 
 module.exports = function registerBackup(deps) {
@@ -139,19 +141,32 @@ module.exports = function registerBackup(deps) {
           try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* optional tidy-up; VACUUM INTO reads a consistent snapshot either way */ }
           const safePath = tmpDb.replace(/'/g, "''");
           db.prepare(`VACUUM INTO '${safePath}'`).run();
-          // If DMs are NOT included, scrub them from the cloned DB so the backup
-          // doesn't ship encrypted-but-still-private DM ciphertext (or attachment
-          // refs) to wherever the admin stores their backup files.
-          if (!has('dms')) {
-            const Database = require('better-sqlite3');
-            const tmp = new Database(tmpDb);
-            try {
+          const Database = require('better-sqlite3');
+          const tmp = new Database(tmpDb);
+          try {
+            // Two-factor secrets and one-time codes never leave the server. With
+            // someone's secret, whoever held the backup could make their codes,
+            // and an admin could reset that person's password and log in as
+            // them, which two-factor exists to stop. A restored server has 2FA
+            // off for everyone until each person turns it on again; passwords
+            // stay (bcrypt hashes) so people can still log in.
+            tmp.exec(`UPDATE users SET totp_secret = NULL, totp_enabled = 0, temp_password_hash = NULL, must_change_password = 0`);
+            tmp.exec('DELETE FROM totp_backup_codes');
+            tmp.exec('DELETE FROM account_recovery_codes');
+            // If DMs are NOT included, scrub them from the cloned DB so the backup
+            // doesn't ship encrypted-but-still-private DM ciphertext (or attachment
+            // refs) to wherever the admin stores their backup files.
+            if (!has('dms')) {
+              // This is the backup's own copy, not the live database, so the
+              // trigger that keeps protected messages must not stop leaving
+              // DMs out. A restore installs it again at startup.
+              tmp.exec('DROP TRIGGER IF EXISTS messages_keep_protected');
               tmp.exec('DELETE FROM messages WHERE channel_id IN (SELECT id FROM channels WHERE is_dm = 1)');
               tmp.exec('DELETE FROM channels WHERE is_dm = 1');
-              tmp.exec('VACUUM');
-            } finally {
-              tmp.close();
             }
+            tmp.exec('VACUUM');
+          } finally {
+            tmp.close();
           }
           // Streamed from disk during finalize; the temp clone is unlinked in finish().
           archive.file(tmpDb, { name: 'haven.db' });
@@ -193,16 +208,33 @@ module.exports = function registerBackup(deps) {
       .catch((err) => { try { fs.unlinkSync(outPath); } catch { /* partial zip may not exist; the real error is rethrown */ } throw err; });
   }
 
-  app.get('/api/admin/backup', async (req, res) => {
-    const token = req.query.token || req.headers.authorization?.split(' ')[1];
+  // A backup download, or an auto-backup's, starts here: the admin's password
+  // (and two-factor code) for a two-minute, one-time ticket. The download
+  // itself carries only the ticket, never the session token.
+  app.post('/api/admin/download-ticket', authLimiter, express.json({ limit: '4kb' }), async (req, res) => {
+    const token = req.headers.authorization?.split(' ')[1];
     const user = token ? verifyToken(token) : null;
     if (!user) return res.status(401).json({ error: 'Unauthorized' });
     if (!verifyAdminFromDb(user)) return res.status(403).json({ error: 'Admin only' });
+    const purpose = req.body && req.body.purpose === 'auto-backup' ? 'auto-backup' : 'backup';
+    const { getDb } = require('../database');
+    const refusal = await checkAdminReauth(getDb(), user.id, { password: req.body?.password, code: req.body?.code });
+    if (refusal) return res.status(401).json({ error: refusal });
+    const data = purpose === 'auto-backup'
+      ? { name: typeof req.body.name === 'string' ? req.body.name : '' }
+      : { include: typeof req.body.include === 'string' ? req.body.include : '' };
+    res.json({ ticket: issueTicket(user.id, purpose, data) });
+  });
+
+  app.get('/api/admin/backup', async (req, res) => {
+    const entry = takeTicket(req.query.ticket, 'backup');
+    if (!entry) return res.status(401).json({ error: 'This download link has expired. Start the backup again.' });
+    if (!verifyAdminFromDb({ id: entry.userId })) return res.status(403).json({ error: 'Admin only' });
 
     // Resolve which sections to include
     let include = [];
-    if (typeof req.query.include === 'string' && req.query.include.trim()) {
-      include = req.query.include.split(',');
+    if (typeof entry.data.include === 'string' && entry.data.include.trim()) {
+      include = entry.data.include.split(',');
     } else if (req.query.mode === 'full') {
       include = ALL_BACKUP_SECTIONS.slice();
     } else {
@@ -239,14 +271,24 @@ module.exports = function registerBackup(deps) {
     // (reporters hit 15GB+), and the old 4GB cap rejected the upload part-way,
     // which surfaced to the browser as a "failed to fetch" (#5436). The practical
     // limit is the host's disk, not this number.
-    limits: { fileSize: 512 * 1024 * 1024 * 1024 },
+    limits: { fileSize: 512 * 1024 * 1024 * 1024, fields: 20, fieldSize: 16 * 1024 },
   });
 
-  app.post('/api/admin/restore', (req, res) => {
+  app.post('/api/admin/restore', authLimiter, async (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     const user = token ? verifyToken(token) : null;
     if (!user) return res.status(401).json({ error: 'Unauthorized' });
     if (!verifyAdminFromDb(user)) return res.status(403).json({ error: 'Admin only' });
+    // A restore can rewrite every account, so it asks for the password (and
+    // two-factor code) again, sent as headers ahead of the upload.
+    {
+      const { getDb } = require('../database');
+      const refusal = await checkAdminReauth(getDb(), user.id, {
+        password: req.headers['x-haven-password'] ? decodeURIComponent(String(req.headers['x-haven-password'])) : '',
+        code: req.headers['x-haven-code'] ? String(req.headers['x-haven-code']) : '',
+      });
+      if (refusal) return res.status(401).json({ error: refusal });
+    }
 
     // A large restore uploads a multi-GB body and then stages it to disk, both of
     // which run far longer than the 2 min socket inactivity timeout. Clear the

@@ -427,7 +427,7 @@ _showMessageContextMenu(e, msgEl) {
     items.push('<hr class="channel-ctx-sep">');
   }
   // First group (as originally defined)
-  if (isOwn) items.push(`<button class="channel-ctx-item" data-action="edit">✏️ <span>${t('msg_toolbar.edit')}</span></button>`);
+  if (isOwn && !isArchived) items.push(`<button class="channel-ctx-item" data-action="edit">✏️ <span>${t('msg_toolbar.edit')}</span></button>`);
   items.push(`<button class="channel-ctx-item" data-action="reply">↩️ <span>${t('msg_toolbar.reply')}</span></button>`);
   items.push(`<button class="channel-ctx-item" data-action="quote">💬 <span>${t('msg_toolbar.quote')}</span></button>`);
   if (canPin) {
@@ -459,8 +459,9 @@ _showMessageContextMenu(e, msgEl) {
   } else if (!isDm && isHighlighted && (isOwn || canDelete)) {
     items.push(`<button class="channel-ctx-item" data-action="highlight-off">📣 <span>${t('msg_toolbar.highlight_off')}</span></button>`);
   }
-  // Separator right above Delete
-  if (canDelete) {
+  // Separator right above Delete. A protected message has no Delete: nobody
+  // can delete it until it is unprotected.
+  if (canDelete && !isArchived) {
     items.push('<hr class="channel-ctx-sep">');
     items.push(`<button class="channel-ctx-item danger" data-action="delete">🗑️ <span>${t('msg_toolbar.delete')}</span></button>`);
   }

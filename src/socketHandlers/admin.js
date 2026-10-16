@@ -12,6 +12,8 @@ const {
   validatedThemeDefault,
 } = require('../themeMetadata');
 const memberDefaults = require('../memberDefaults');
+const { reachableChannel } = require('./channelAccess');
+const { cleanWebhookName, cleanWebhookAvatarUrl } = require('../webhookFields');
 
 const THEMES_DIR = path.join(__dirname, '..', '..', 'themes');
 
@@ -191,7 +193,13 @@ module.exports = function register(socket, ctx) {
     if (key === 'fcm_enabled' && !['true', 'false'].includes(value)) return;
     if (key === 'unicode_emoji_auto_update' && !['true', 'false'].includes(value)) return;
     if (key === 'automod_link_mode' && !['off', 'allowlist', 'blocklist'].includes(value)) return;
-    if (key === 'automod_link_exempt_level') { const n = parseInt(value); if (isNaN(n) || n < 0 || n > 100) return; }
+    if (key === 'automod_link_exempt_level') {
+      const n = parseInt(value); if (isNaN(n) || n < 0 || n > 100) return;
+      // Staff at or above the exempt level are left alone by auto-mod. Someone
+      // who is not the admin may not raise it past their own level: set to
+      // 100, it let auto-mod mute or ban the staff above them.
+      if (!socket.user.isAdmin && n > getUserEffectiveLevel(socket.user.id)) return;
+    }
     if (key === 'automod_link_min_account_hours') { const n = parseInt(value); if (isNaN(n) || n < 0 || n > 8760) return; }
     if (key === 'automod_new_account_post_minutes') { const n = parseInt(value, 10); if (!Number.isInteger(n) || n < 0 || n > 10080 || String(n) !== String(value).trim()) return; }
     if (key === 'automod_log_channel' && value && !/^[a-f0-9]{8}$/i.test(value)) return;
@@ -242,7 +250,19 @@ module.exports = function register(socket, ctx) {
     // otherwise a numeric id of an existing role.
     if (key === 'channel_creator_role' && value !== '' && value !== 'default' && value !== 'none') {
       const rid = parseInt(value, 10);
-      if (isNaN(rid) || !db.prepare('SELECT 1 FROM roles WHERE id = ?').get(rid)) return;
+      const role = isNaN(rid) ? null : db.prepare('SELECT id, level FROM roles WHERE id = ?').get(rid);
+      if (!role) return;
+      // Everyone who creates a channel gets this role in it. Someone who is
+      // not the admin may only pick one they could hand out themselves: below
+      // their level, and nothing they do not hold. Pointed at the Admin role,
+      // it gave every channel creator level 99 in their channel.
+      if (!socket.user.isAdmin) {
+        if (role.level >= getUserEffectiveLevel(socket.user.id)) return;
+        const mine = new Set(ctx.getUserGlobalPermissions(socket.user.id));
+        const perms = db.prepare('SELECT permission FROM role_permissions WHERE role_id = ? AND allowed = 1').all(rid).map(r => r.permission);
+        const adminOnly = ['transfer_admin', 'manage_roles', 'manage_server', 'delete_channel', 'view_all_channels'];
+        if (perms.some(p => adminOnly.includes(p) || !(mine.has('*') || mine.has(p)))) return;
+      }
     }
 
     if (key === 'registration_captcha_enabled' && !['true', 'false'].includes(value)) return;
@@ -411,6 +431,12 @@ module.exports = function register(socket, ctx) {
         const parts = value.split(',').map(s => s.trim());
         if (!parts.every(p => /^\d+$/.test(p) && parseInt(p) > 0)) return;
         if (parts.length > 500) return;
+        // Guests can read what they are given. Someone who is not the admin
+        // may not hand them a private or role-gated channel.
+        if (!socket.user.isAdmin) {
+          const closed = db.prepare(`SELECT 1 FROM channels WHERE id IN (${parts.map(() => '?').join(',')}) AND (is_private = 1 OR role_gate IS NOT NULL OR is_dm = 1) LIMIT 1`).get(...parts.map(Number));
+          if (closed) return;
+        }
       }
     }
     if (key === 'stun_urls') {
@@ -938,19 +964,22 @@ module.exports = function register(socket, ctx) {
   // channel they belong to. manage_webhooks is a default Mod permission, and
   // without this a Mod could hang a bot on a private channel or a DM and have
   // its callback receive every message posted there.
+  // A role-gated channel counts only when its gate lets them in: a bot
+  // there reads every message through its callback.
   const canBotChannel = (channelId) => {
-    const ch = db.prepare('SELECT id, is_dm FROM channels WHERE id = ?').get(channelId);
+    const ch = db.prepare('SELECT id, is_dm, role_gate FROM channels WHERE id = ?').get(channelId);
     if (!ch || ch.is_dm) return false;
     if (socket.user.isAdmin) return true;
-    return !!db.prepare('SELECT 1 FROM channel_members WHERE channel_id = ? AND user_id = ?').get(ch.id, socket.user.id);
+    if (!db.prepare('SELECT 1 FROM channel_members WHERE channel_id = ? AND user_id = ?').get(ch.id, socket.user.id)) return false;
+    return ctx.roleGateAllows(socket.user.id, ch);
   };
+  // Someone else's bot: seen, never its token or callback secret, and not
+  // changed (where it sends messages, with what secret) except by the admin
+  // or its creator.
+  const ownsBot = (webhook) => socket.user.isAdmin || webhook.created_by === socket.user.id;
   const visibleWebhookRows = rows => rows
     .filter(webhook => socket.user.isAdmin || canBotChannel(webhook.channel_id))
-    .map(webhook =>
-      socket.user.isAdmin || webhook.created_by === socket.user.id
-        ? webhook
-        : { ...webhook, token: null }
-    );
+    .map(webhook => ownsBot(webhook) ? webhook : { ...webhook, token: null, callback_secret: null });
 
   socket.on('create-webhook', (data) => {
     if (!data || typeof data !== 'object') return;
@@ -965,7 +994,7 @@ module.exports = function register(socket, ctx) {
       const channel = db.prepare('SELECT id, code FROM channels WHERE code = ? AND is_dm = 0').get(channelCode);
       if (!channel || !canBotChannel(channel.id)) return socket.emit('error-msg', 'Channel not found');
 
-      const name = typeof data.name === 'string' ? data.name.trim().slice(0, 32) : 'Bot';
+      const name = typeof data.name === 'string' ? cleanWebhookName(data.name) : 'Bot';
       if (!name) return socket.emit('error-msg', 'Webhook name is required');
 
       const token = crypto.randomBytes(32).toString('hex');
@@ -985,10 +1014,14 @@ module.exports = function register(socket, ctx) {
       }
     } else {
       // Bot-manager variant
-      const name = typeof data.name === 'string' ? data.name.trim().slice(0, 32) : '';
+      const name = cleanWebhookName(data.name);
       const channelId = parseInt(data.channel_id);
-      const avatarUrl = typeof data.avatar_url === 'string' ? data.avatar_url.trim().slice(0, 512) : null;
+      // Only this server's uploads or https images, as for a message's avatar.
+      const avatarUrl = cleanWebhookAvatarUrl(data.avatar_url);
       if (!name || isNaN(channelId)) return socket.emit('error-msg', 'Name and channel required');
+      if (typeof data.avatar_url === 'string' && data.avatar_url.trim() && !avatarUrl) {
+        return socket.emit('error-msg', 'Bot avatar must be an uploaded image or an https link');
+      }
 
       const channel = db.prepare('SELECT id, name FROM channels WHERE id = ?').get(channelId);
       if (!channel || !canBotChannel(channel.id)) return socket.emit('error-msg', 'Channel not found');
@@ -1051,8 +1084,9 @@ module.exports = function register(socket, ctx) {
     // Per-channel variant uses webhookId, bot-manager uses id
     const webhookId = parseInt(data.webhookId || data.id);
     if (!webhookId || isNaN(webhookId)) return;
-    const _delWh = db.prepare('SELECT channel_id FROM webhooks WHERE id = ?').get(webhookId);
+    const _delWh = db.prepare('SELECT channel_id, created_by FROM webhooks WHERE id = ?').get(webhookId);
     if (!_delWh || !canBotChannel(_delWh.channel_id)) return socket.emit('error-msg', 'Webhook not found');
+    if (!ownsBot(_delWh)) return socket.emit('error-msg', 'Only the person who made this bot, or the admin, can delete it');
 
     revokeBotVoiceAccess?.(webhookId, 'Webhook was deleted');
     db.prepare('DELETE FROM webhooks WHERE id = ?').run(webhookId);
@@ -1084,8 +1118,9 @@ module.exports = function register(socket, ctx) {
     const webhookId = parseInt(data.webhookId || data.id);
     if (!webhookId || isNaN(webhookId)) return;
 
-    const wh = db.prepare('SELECT is_active, channel_id FROM webhooks WHERE id = ?').get(webhookId);
+    const wh = db.prepare('SELECT is_active, channel_id, created_by FROM webhooks WHERE id = ?').get(webhookId);
     if (!wh || !canBotChannel(wh.channel_id)) return socket.emit('error-msg', 'Webhook not found');
+    if (!ownsBot(wh)) return socket.emit('error-msg', 'Only the person who made this bot, or the admin, can turn it on or off');
     const newState = wh.is_active ? 0 : 1;
     db.prepare('UPDATE webhooks SET is_active = ? WHERE id = ?').run(newState, webhookId);
     if (!newState) revokeBotVoiceAccess?.(webhookId, 'Webhook was disabled');
@@ -1116,10 +1151,10 @@ module.exports = function register(socket, ctx) {
 
     const wh = db.prepare('SELECT * FROM webhooks WHERE id = ?').get(webhookId);
     if (!wh || !canBotChannel(wh.channel_id)) return socket.emit('error-msg', 'Webhook not found');
-
     if (data.can_use_voice !== undefined && !socket.user.isAdmin) {
       return socket.emit('error-msg', 'Only admins can change a bot\'s voice permission');
     }
+    if (!ownsBot(wh)) return socket.emit('error-msg', 'Only the person who made this bot, or the admin, can change it');
 
     if (data.channel_id !== undefined) {
       const requestedChannelId = parseInt(data.channel_id);
@@ -1128,8 +1163,16 @@ module.exports = function register(socket, ctx) {
       }
     }
 
-    if (typeof data.name === 'string' && data.name.trim()) {
-      db.prepare('UPDATE webhooks SET name = ? WHERE id = ?').run(data.name.trim().slice(0, 32), webhookId);
+    // Checked before anything is written, so a refused avatar leaves the bot
+    // exactly as it was.
+    const newAvatar = data.avatar_url !== undefined ? cleanWebhookAvatarUrl(data.avatar_url) : null;
+    if (typeof data.avatar_url === 'string' && data.avatar_url.trim() && !newAvatar) {
+      return socket.emit('error-msg', 'Bot avatar must be an uploaded image or an https link');
+    }
+
+    const newName = cleanWebhookName(data.name);
+    if (newName) {
+      db.prepare('UPDATE webhooks SET name = ? WHERE id = ?').run(newName, webhookId);
     }
     if (data.channel_id !== undefined) {
       const channelId = parseInt(data.channel_id);
@@ -1142,8 +1185,7 @@ module.exports = function register(socket, ctx) {
       }
     }
     if (data.avatar_url !== undefined) {
-      const av = typeof data.avatar_url === 'string' ? data.avatar_url.trim().slice(0, 512) : null;
-      db.prepare('UPDATE webhooks SET avatar_url = ? WHERE id = ?').run(av || null, webhookId);
+      db.prepare('UPDATE webhooks SET avatar_url = ? WHERE id = ?').run(newAvatar, webhookId);
     }
     if (data.callback_url !== undefined) {
       let cbUrl = typeof data.callback_url === 'string' ? data.callback_url.trim().slice(0, 1024) : null;
@@ -1213,7 +1255,7 @@ module.exports = function register(socket, ctx) {
       FROM webhooks w JOIN channels c ON w.channel_id = c.id
       WHERE w.id = ? AND w.is_active = 1
     `).get(webhookId);
-    if (!wh) return socket.emit('error-msg', 'Webhook not found or inactive');
+    if (!wh || !canBotChannel(wh.channel_id)) return socket.emit('error-msg', 'Webhook not found or inactive');
     if (!wh.callback_url) return socket.emit('error-msg', 'Webhook has no callback URL');
 
     if (typeof fireWebhookEvent === 'function') {
@@ -1238,8 +1280,12 @@ module.exports = function register(socket, ctx) {
     if (!canSeeAll) {
       const channelCode = data && typeof data.channelCode === 'string' ? data.channelCode : null;
       if (channelCode) {
-        const ch = db.prepare('SELECT id FROM channels WHERE code = ? AND is_dm = 0').get(channelCode);
-        if (ch && userHasPermission(socket.user.id, 'view_channel_members', ch.id)) {
+        const ch = db.prepare('SELECT id, role_gate FROM channels WHERE code = ? AND is_dm = 0').get(channelCode);
+        // Its members are listed for people in the channel, and through its
+        // gate, not for anyone who knows its code.
+        const inIt = ch && !!db.prepare('SELECT 1 FROM channel_members WHERE channel_id = ? AND user_id = ?').get(ch.id, socket.user.id)
+          && ctx.roleGateAllows(socket.user.id, ch);
+        if (inIt && userHasPermission(socket.user.id, 'view_channel_members', ch.id)) {
           channelOnly = ch.id;
         }
       }
@@ -1299,10 +1345,21 @@ module.exports = function register(socket, ctx) {
       `).all();
       ccRows.forEach(r => { channelCounts[r.user_id] = r.cnt; });
 
+      // Moderators see the channels they can see themselves, and no invite
+      // codes: a code is enough to join, so listing every channel's code
+      // handed private channels to anyone with kick or ban permission.
+      const seenBy = new Set();
+      if (canMod && !isAdmin) {
+        for (const c of db.prepare('SELECT c.id, c.role_gate FROM channels c JOIN channel_members cm ON cm.channel_id = c.id AND cm.user_id = ? WHERE c.is_dm = 0').all(socket.user.id)) {
+          if (ctx.roleGateAllows(socket.user.id, c)) seenBy.add(c.id);
+        }
+      }
+      const visible = (id) => isAdmin || seenBy.has(id);
       let allChannels = [];
       if (canMod) {
         allChannels = db.prepare('SELECT id, name, code, parent_channel_id FROM channels WHERE is_dm = 0 ORDER BY position, name').all()
-          .map(c => ({ id: c.id, name: c.name, code: c.code, parentId: c.parent_channel_id }));
+          .filter(c => visible(c.id))
+          .map(c => ({ id: c.id, name: c.name, code: isAdmin ? c.code : undefined, parentId: c.parent_channel_id }));
       }
 
       const userChannelMap = {};
@@ -1312,8 +1369,9 @@ module.exports = function register(socket, ctx) {
           FROM channel_members cm JOIN channels c ON cm.channel_id = c.id WHERE c.is_dm = 0
         `).all();
         cmRows.forEach(r => {
+          if (!visible(r.channel_id)) return;
           if (!userChannelMap[r.user_id]) userChannelMap[r.user_id] = [];
-          userChannelMap[r.user_id].push({ id: r.channel_id, name: r.channel_name, code: r.channel_code });
+          userChannelMap[r.user_id].push({ id: r.channel_id, name: r.channel_name, code: isAdmin ? r.channel_code : undefined });
         });
       }
 
@@ -1411,6 +1469,15 @@ module.exports = function register(socket, ctx) {
         'FROM audit_log ' + whereSql + ' ORDER BY id DESC LIMIT ?'
       ).all(...params);
       const actions = db.prepare('SELECT DISTINCT action FROM audit_log ORDER BY action ASC').all().map(r => r.action);
+      // Channel codes are invites (a code is enough to join), so only the
+      // admin sees them in the log.
+      if (!isAdmin) {
+        const hide = (v) => (typeof v === 'string' ? v.replace(/\b[a-f0-9]{8}\b/gi, '(code hidden)') : v);
+        for (const r of rows) {
+          r.target_name = hide(r.target_name);
+          r.details = hide(r.details);
+        }
+      }
       cb({ rows, actions, hasMore: rows.length === limit });
     } catch (err) {
       console.error('get-audit-log error:', err);
@@ -1672,7 +1739,7 @@ module.exports = function register(socket, ctx) {
     const limit = (data && Number.isInteger(data.limit) && data.limit > 0 && data.limit <= 500) ? data.limit : 100;
     try {
       const entries = db.prepare(`
-        SELECT i.id, i.rule, i.host, i.excerpt, i.created_at, i.user_id,
+        SELECT i.id, i.rule, i.host, i.excerpt, i.created_at, i.user_id, i.channel_id,
                COALESCE(u.display_name, u.username, '[deleted user]') AS username,
                c.code AS channel_code, c.name AS channel_name
         FROM automod_infractions i
@@ -1681,6 +1748,24 @@ module.exports = function register(socket, ctx) {
         ORDER BY i.created_at DESC LIMIT ?
       `).all(limit);
       entries.forEach(e => { e.created_at = utcStamp(e.created_at); });
+      // As in the audit log, a channel code (an invite) is the admin's alone,
+      // and someone else sees what was blocked only in channels they can open.
+      if (!socket.user.isAdmin) {
+        const seen = new Map();
+        const canSee = (id) => {
+          if (!seen.has(id)) {
+            const ch = reachableChannel(ctx, socket.user, id);
+            seen.set(id, !!ch && !ch.is_dm);
+          }
+          return seen.get(id);
+        };
+        for (let i = entries.length - 1; i >= 0; i--) {
+          const e = entries[i];
+          if (e.channel_id != null && !canSee(e.channel_id)) entries.splice(i, 1);
+          else e.channel_code = null;
+        }
+      }
+      entries.forEach(e => { delete e.channel_id; });
 
       // Most-blocked hosts in the last week, so a domain that everyone keeps
       // trying to share is easy to spot and allow in one click.

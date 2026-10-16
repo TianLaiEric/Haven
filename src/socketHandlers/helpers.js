@@ -273,7 +273,8 @@ function releasableUploads(db, relPaths, ownerIds, { ignoreMessagesAfter = null 
   if (!owners.size) return [];
   const ownership = db.prepare('SELECT user_id, scope FROM upload_ownership WHERE rel_path = ?');
   const before = Number.isInteger(ignoreMessagesAfter) ? ignoreMessagesAfter : Number.MAX_SAFE_INTEGER;
-  const inMessages = db.prepare('SELECT 1 FROM messages WHERE instr(content, ?) > 0 AND id < ? LIMIT 1');
+  // A protected message keeps its files whenever it was posted.
+  const inMessages = db.prepare('SELECT 1 FROM messages WHERE instr(content, ?) > 0 AND (id < ? OR is_archived = 1) LIMIT 1');
   const inProfiles = db.prepare(`
     SELECT 1 WHERE
          EXISTS(SELECT 1 FROM users WHERE instr(COALESCE(avatar, ''), @p) > 0 OR instr(COALESCE(border, ''), @p) > 0)
@@ -322,6 +323,11 @@ function validEscalation(raw) {
       && !(c.muteAt && c.warnAt && Number(c.muteAt) < Number(c.warnAt)) && !(c.banAt && c.muteAt && Number(c.banAt) < Number(c.muteAt));
   } catch { return false; }
 }
+// New conversations (one to one or group) a member may start per hour. A new
+// DM or group invite lands in other people's lists, so without a cap one
+// account could reach every member of a server in minutes. Admins are not
+// limited.
+const NEW_DMS_PER_HOUR = 20;
 const CHANNEL_NAME_RE = /^[\w\s\-!?.,'&+\p{L}\p{M}\p{Emoji_Presentation}\p{Extended_Pictographic}\p{Emoji}\uFE0F\u200D]+$/u;
 // A role menu (self-assign roles): the emoji each role is picked with, and
 // the message text the menu is posted with.
@@ -334,4 +340,5 @@ module.exports = {
   sanitizeBorderTransform, parseBorderTransform, VALID_ROLE_PERMS, ADMIN_ONLY_PERMS, CHANNEL_NAME_RE, ROLE_MENU_EMOJI_RE, roleMenuContent,
   normalizeWordGroups, validEscalation, filterIdleOnline,
   replyAuthorUsername, toReplyContext, stripRoleMentions, releasableUploads,
+  NEW_DMS_PER_HOUR,
 };

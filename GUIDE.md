@@ -227,7 +227,9 @@ Haven can copy a Discord server's message history into Haven channels. The easie
 5. Click **Fetch Messages** and wait while Haven copies them. A big server can take a few minutes
 6. In the preview, rename channels if you want, then click **Import Selected**
 
-The bot can only import channels it can see on Discord. If a channel is private there, give the bot's role access to it first. Otherwise Haven skips that channel and tells you which ones it skipped.
+Discord keeps private channels hidden from the bot until its role is added to them. Haven greys those channels out with a 🔒 so you can see which ones they are. To bring one in, add the bot's role to that channel in Discord with **View Channel** and **Read Message History** ([here's how](#2-connect-it-to-haven)), then pick your server again. If a channel still can't be read, Haven skips it and tells you which ones it skipped.
+
+Don't give the bot **Administrator** to get around this. Anyone who got hold of its token would then control your whole Discord server.
 
 **What gets imported:** messages, replies, embeds, reactions, pins, links to attachments, and the original Discord names and avatars.
 
@@ -786,7 +788,15 @@ no_proxy=localhost,127.0.0.1
 
 Link previews, the media proxy, bot callbacks, push notifications and Haven's other outgoing requests then go through the proxy. Hosts listed in `no_proxy` (names, subdomains, IP addresses or CIDR ranges) connect directly. Only `http://` proxy addresses are supported. Voice traffic is UDP and does not use the proxy.
 
-> ⚠️ **Your proxy becomes part of Haven's security.** For a request through the proxy, Haven can't pin the connection to the address it checked, and names it can't resolve itself are passed to the proxy. Haven still refuses private, loopback and cloud metadata addresses it can see, but a proxy that can reach your internal network could let members use link previews to reach hosts behind it. Restrict the proxy to the destinations Haven needs, ideally with whole-hostname allowlist rules.
+For a link a member posts (link previews, the media proxy, bot callbacks, push), Haven looks the name up itself, refuses private, loopback and cloud metadata addresses, and then sends the proxy to the address it checked: a `CONNECT` to that IP for `https://` sites, and the IP in the request line (with the site's name in the `Host` header) for `http://` sites. The proxy never has to look the name up again, so it can't be steered to a different address.
+
+A name the server can't resolve on its own is refused. If your server has no DNS of its own and only the proxy can resolve names, set:
+
+```env
+OUTBOUND_PROXY_RESOLVES_NAMES=true
+```
+
+> ⚠️ **With that setting, your proxy becomes part of Haven's security.** Names Haven can't resolve are then passed to the proxy unchecked, and the proxy decides where they go. A proxy that can reach your internal network could let members use link previews to reach hosts behind it. Restrict the proxy to the destinations Haven needs, ideally with whole-hostname allowlist rules.
 
 ---
 
@@ -1141,6 +1151,19 @@ review. Setting one up takes a couple of minutes and is free.
    Haven author's name and picture instead of all arriving as one anonymous bot
 5. Back in Haven, turn on the **Ferry is on** switch
 
+**Private channels.** Discord keeps private channels hidden from the bot until its role
+is added to them, even when the bot can see everything else on the server. Haven marks
+those channels with a 🔒 when you pair or import. For each private channel you want
+bridged or imported:
+
+1. In Discord, right-click the channel and pick **Edit Channel**
+2. Open **Permissions**. Under **Advanced permissions**, click **+** and pick the bot's
+   role (it has the same name as the bot)
+3. Set **View Channel** and **Read Message History** to the green check, then save
+
+Don't give the bot **Administrator** to get around this. It works, but then anyone who
+gets hold of the bot's token controls your whole Discord server.
+
 ### 3. Pair some channels
 
 A pairing joins one Haven channel to one Discord channel. Each pairing has two settings:
@@ -1236,6 +1259,7 @@ The Ferry panel shows the connection state and the last error on each pairing.
 | Discord refused the Message Content intent | Turn it on in the Developer Portal, Bot tab |
 | Discord rejected the bot token | Reset the token in the portal and paste the new one |
 | The bot needs "Manage Webhooks" | Give the bot that permission in the Discord channel |
+| Nothing ever arrives from a private Discord channel | Add the bot's role to that channel (see [Private channels](#2-connect-it-to-haven)) |
 | Discord refused the Server Members intent | Turn it on in the portal, or leave DMs off |
 | This pairing joins a forum to a channel that is not a forum | A paired Haven channel was switched to or from a forum. Remove the pairing and pair matching kinds |
 | That Discord forum requires a tag on every post | Add a Haven forum tag named like one of the Discord forum's tags and tag the topic with it |
@@ -1474,8 +1498,8 @@ Content-Type: application/json
 ```
 
 - `content` (required): message text, max 4000 characters
-- `username` (optional): override the bot's display name for this message
-- `avatar_url` (optional): override the bot's avatar for this message
+- `username` (optional): override the bot's display name for this message (max 32 characters; control characters and `<` `>` are removed)
+- `avatar_url` (optional): override the bot's avatar for this message. It must be an `https://` link or one of this server's `/uploads/` files; anything else is dropped and the message posts with no avatar
 - `ephemeral` (optional): when `true`, deliver only to `recipient_id` and do not store in history
 - `recipient_id` (required when `ephemeral` is `true`): user id that should receive the private bot message
 - `reply_to` (optional): id of a message in the same channel to reply to

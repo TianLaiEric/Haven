@@ -1209,7 +1209,7 @@ _createMessageEl(msg, prevMsg) {
   }
 
   const color = this._getUserColor(msg.username);
-  const initial = msg.username.charAt(0).toUpperCase();
+  const initial = this._escapeHtml(msg.username.charAt(0).toUpperCase());
   // Look up user's role from online users list (falls back to channelMembers for offline users)
   const onlineUser = this._memberById(msg.user_id);
   // Use the message sender's avatar_shape (from server), not the local user's preference
@@ -1221,13 +1221,13 @@ _createMessageEl(msg, prevMsg) {
   if (msg.imported_from === 'discord') {
     const discordAvatar = msg.webhook_avatar;
     if (discordAvatar) {
-      avatarHtml = `<img class="message-avatar message-avatar-img ${shapeClass}"${this._animAttr(msg.animateProfile)} src="${this._escapeHtml(discordAvatar)}" loading="lazy" alt="${initial}"><div class="message-avatar ${shapeClass}" style="background-color:${color};display:none">${initial}</div>`;
+      avatarHtml = `<img class="message-avatar message-avatar-img ${shapeClass}"${this._animAttr(msg.animateProfile)} ${this._imgSrcAttr(discordAvatar)} loading="lazy" alt="${initial}"><div class="message-avatar ${shapeClass}" style="background-color:${color};display:none">${initial}</div>`;
     } else {
       // Generic Discord-style avatar (colored circle with initial)
       avatarHtml = `<div class="message-avatar ${shapeClass} discord-import-avatar" style="background-color:#5865f2">${initial}</div>`;
     }
   } else if (msg.avatar) {
-    avatarHtml = `<img class="message-avatar message-avatar-img ${shapeClass}"${this._animAttr(msg.animateProfile)} src="${this._escapeHtml(msg.avatar)}" loading="lazy" alt="${initial}"><div class="message-avatar ${shapeClass}" style="background-color:${color};display:none">${initial}</div>`;
+    avatarHtml = `<img class="message-avatar message-avatar-img ${shapeClass}"${this._animAttr(msg.animateProfile)} ${this._imgSrcAttr(msg.avatar)} loading="lazy" alt="${initial}"><div class="message-avatar ${shapeClass}" style="background-color:${color};display:none">${initial}</div>`;
   } else {
     avatarHtml = `<div class="message-avatar ${shapeClass}" style="background-color:${color}">${initial}</div>`;
   }
@@ -1260,6 +1260,7 @@ _createMessageEl(msg, prevMsg) {
   // The author name, painted by a gradient role when the author has one.
   const authorText = msg.persona_id ? msg.username : this._getNickname(msg.user_id, msg.username);
   const authorHtml = authorRoleStyled ? this._roleNameHtml(onlineUser.role, authorText) : this._escapeHtml(authorText);
+  const birthdayMark = msg.persona_id || msg.is_webhook || msg.imported_from ? '' : this._birthdayMarkHtml(onlineUser?.birthday);
 
   const botBadge = msg.imported_from === 'discord'
     ? '<span class="discord-badge">DISCORD</span>'
@@ -1323,7 +1324,7 @@ _createMessageEl(msg, prevMsg) {
       <div class="message-body">
         ${replyHtml}
         <div class="message-header">
-          ${msgRoleIconBefore}
+          ${msgRoleIconBefore}${birthdayMark}
           <span class="message-author" style="color:${authorColor}"${!msg.persona_id && this._nicknames[msg.user_id] ? ` title="${this._escapeHtml(msg.username)}"` : ''}>${authorHtml}</span>
           ${msgRoleIconAfter}
           ${botBadge}
@@ -1390,7 +1391,7 @@ _promoteCompactToFull(compactEl) {
   const statusSlotHtml = needsStatusSlot ? `<span class="message-inline-status">${e2eTag}</span>` : '';
 
   const color = this._getUserColor(username);
-  const initial = username.charAt(0).toUpperCase();
+  const initial = this._escapeHtml(username.charAt(0).toUpperCase());
   const onlineUser = this._memberById(userId);
   // Prefer the avatar stored on the compact element (set at render time from server data).
   // Fall back to the online-users list so newly-uploaded avatars still appear.
@@ -1403,7 +1404,7 @@ _promoteCompactToFull(compactEl) {
   try { if (compactEl.dataset.borderTransform) borderTransform = JSON.parse(compactEl.dataset.borderTransform); } catch { /* malformed border data: keep the member list value */ }
   const animateProfile = compactEl.dataset.animateProfile || (onlineUser && onlineUser.animateProfile) || 'trigger';
   const avatarHtml = avatar
-    ? `<img class="message-avatar message-avatar-img ${shapeClass}"${this._animAttr(animateProfile)} src="${this._escapeHtml(avatar)}" loading="lazy" alt="${initial}"><div class="message-avatar ${shapeClass}" style="background-color:${color};display:none">${initial}</div>`
+    ? `<img class="message-avatar message-avatar-img ${shapeClass}"${this._animAttr(animateProfile)} ${this._imgSrcAttr(avatar)} loading="lazy" alt="${initial}"><div class="message-avatar ${shapeClass}" style="background-color:${color};display:none">${initial}</div>`
     : `<div class="message-avatar ${shapeClass}" style="background-color:${color}">${initial}</div>`;
 
   // Multi-role aware (compact-to-full path); mirror of _createMessageEl above.
@@ -1431,6 +1432,7 @@ _promoteCompactToFull(compactEl) {
   const authorColor2 = roleStyled2 ? this._safeColor(onlineUser.role.color, color) : color;
   const authorText2 = this._getNickname(userId, username);
   const authorHtml2 = roleStyled2 ? this._roleNameHtml(onlineUser.role, authorText2) : this._escapeHtml(authorText2);
+  const birthdayMark2 = compactEl.dataset.personaId ? '' : this._birthdayMarkHtml(onlineUser?.birthday);
 
   // Replace the compact element in-place
   const wasAnnouncement = compactEl.classList.contains('announcement');
@@ -1447,7 +1449,7 @@ _promoteCompactToFull(compactEl) {
       ${this._avatarWithBorder(avatarHtml, { border, borderTransform, animateProfile })}
       <div class="message-body">
         <div class="message-header">
-          ${msgRoleIconBefore2}
+          ${msgRoleIconBefore2}${birthdayMark2}
           <span class="message-author" style="color:${authorColor2}"${this._nicknames[userId] ? ` title="${this._escapeHtml(username)}"` : ''}>${authorHtml2}</span>
           ${msgRoleIconAfter2}
           ${msgRoleBadge}

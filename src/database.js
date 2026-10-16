@@ -13,6 +13,7 @@ const { migrateImportedAuthors } = require('./importAuthors');
 const forumUnread = require('./forumUnread');
 const { migrateForumVotes } = require('./forumVotes');
 const { migrateForumBlog } = require('./forumBlog');
+const { installGuard: installProtectedGuard } = require('./protectedMessages');
 
 let db;
 
@@ -674,6 +675,14 @@ function initDatabase() {
   // ── Migration: bio column ─────────────────────────────────
   addColumn('users', 'bio', "TEXT DEFAULT ''");
 
+  // ── Migration: birthday (YYYY-MM-DD) and when it was set (ISO UTC).
+  // A birthday is set once and never changes; birthday_hidden keeps it off
+  // the profile and member lists without throwing the date away.
+  addColumn('users', 'birthday', "TEXT DEFAULT NULL");
+  addColumn('users', 'birthday_set_at', "TEXT DEFAULT NULL");
+  addColumn('users', 'birthday_hide_year', "INTEGER DEFAULT 1");
+  addColumn('users', 'birthday_hidden', "INTEGER DEFAULT 0");
+
   // ── Migration: custom_sounds table (admin-uploaded notification sounds) ──
   db.exec(`
     CREATE TABLE IF NOT EXISTS custom_sounds (
@@ -800,6 +809,10 @@ function initDatabase() {
   // ── Migration: webhook message tracking ─────────────────
   addColumn('messages', 'is_webhook', "INTEGER DEFAULT 0");
   addColumn('messages', 'webhook_username', "TEXT DEFAULT NULL");
+  // Which bot posted it, so a bot without moderation permission can delete
+  // its own messages and not every other bot's. Ids are AUTOINCREMENT, so a
+  // deleted bot's id is never handed to a new one.
+  addColumn('messages', 'webhook_id', "INTEGER DEFAULT NULL");
 
   // ── Migration: personas (proxy feature) (#86, #5349) ────
   // Per-user personas: name + avatar override stored on the message so the
@@ -1672,6 +1685,10 @@ function initDatabase() {
         SELECT value FROM json_each(OLD.e2e_files) WHERE type = 'text';
     END;
   `);
+
+  // Protected messages survive every delete, cascades included; see
+  // src/protectedMessages.js.
+  installProtectedGuard(db);
 
   // ── Audit log ───────────────────────────────────────────
   // Tracks admin/moderator actions: channel CRUD, role changes,

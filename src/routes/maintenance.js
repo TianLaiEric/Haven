@@ -9,7 +9,14 @@ const { DATA_DIR, DB_PATH, UPLOADS_DIR, DELETED_ATTACHMENTS_DIR } = require('../
 const { purgeDeletedAttachments, resolveDeletedRetentionDays } = require('../deletedAttachments');
 const { trimUploadsToLimit } = require('../uploadsTrim');
 const { findOrphanDms } = require('../orphanDms');
+const protectedMessages = require('../protectedMessages');
+
+// What auto-cleanup may remove from a message table aliased m: not protected
+// (nor a thread head holding a protected reply), not pinned, and not in a
+// channel exempt from cleanup.
+const CLEANABLE = `${protectedMessages.deletableSql('m')} AND m.id NOT IN (SELECT message_id FROM pinned_messages) AND m.channel_id NOT IN (SELECT id FROM channels WHERE cleanup_exempt = 1)`;
 const { verifyToken } = require('../auth');
+const { takeTicket } = require('../adminReauth');
 const { getDdnsStatus, triggerDdnsNow } = require('../ddns');
 
 module.exports = function registerMaintenance(deps) {
@@ -72,28 +79,21 @@ module.exports = function registerMaintenance(deps) {
         }
       };
 
-      // 1. Delete messages older than N days (skip archived/pinned messages
-      // and exempt channels)
+      // 1. Delete messages older than N days (skip protected and pinned
+      // messages, thread heads holding a protected reply, and exempt channels)
       if (maxAgeDays > 0) {
+        const oldSql = `SELECT m.id FROM messages m WHERE m.created_at < datetime('now', ?) AND ${CLEANABLE}`;
         // Capture the attachments of the messages we're about to delete first,
         // so their files can follow them into deleted-attachments afterward.
         const doomed = db.prepare(
-          "SELECT content FROM messages WHERE created_at < datetime('now', ?) AND is_archived = 0 AND id NOT IN (SELECT message_id FROM pinned_messages) AND channel_id NOT IN (SELECT id FROM channels WHERE cleanup_exempt = 1)"
+          `SELECT content FROM messages WHERE id IN (${oldSql})`
         ).all(`-${maxAgeDays} days`);
         const doomedAttachments = new Set();
         for (const row of doomed) for (const p of extractUploadRelPaths(row.content)) doomedAttachments.add(p);
 
         // Delete reactions for old messages first
-        db.prepare(`
-        DELETE FROM reactions WHERE message_id IN (
-          SELECT id FROM messages WHERE created_at < datetime('now', ?) AND is_archived = 0
-          AND id NOT IN (SELECT message_id FROM pinned_messages)
-          AND channel_id NOT IN (SELECT id FROM channels WHERE cleanup_exempt = 1)
-        )
-      `).run(`-${maxAgeDays} days`);
-        const result = db.prepare(
-          "DELETE FROM messages WHERE created_at < datetime('now', ?) AND is_archived = 0 AND id NOT IN (SELECT message_id FROM pinned_messages) AND channel_id NOT IN (SELECT id FROM channels WHERE cleanup_exempt = 1)"
-        ).run(`-${maxAgeDays} days`);
+        db.prepare(`DELETE FROM reactions WHERE message_id IN (${oldSql})`).run(`-${maxAgeDays} days`);
+        const result = db.prepare(`DELETE FROM messages WHERE id IN (${oldSql})`).run(`-${maxAgeDays} days`);
         totalDeleted += result.changes;
 
         relocateOrphanAttachments(doomedAttachments);
@@ -108,10 +108,10 @@ module.exports = function registerMaintenance(deps) {
         if (sizeMb > maxSizeMb) {
           // Delete oldest 10% of non-archived, non-pinned messages to bring
           // size down.
-          const totalCount = db.prepare('SELECT COUNT(*) as cnt FROM messages WHERE is_archived = 0 AND id NOT IN (SELECT message_id FROM pinned_messages) AND channel_id NOT IN (SELECT id FROM channels WHERE cleanup_exempt = 1)').get().cnt;
+          const totalCount = db.prepare(`SELECT COUNT(*) as cnt FROM messages m WHERE ${CLEANABLE}`).get().cnt;
           const deleteCount = Math.max(Math.floor(totalCount * 0.1), 100);
           const oldestRows = db.prepare(
-            'SELECT id, content FROM messages WHERE is_archived = 0 AND id NOT IN (SELECT message_id FROM pinned_messages) AND channel_id NOT IN (SELECT id FROM channels WHERE cleanup_exempt = 1) ORDER BY created_at ASC LIMIT ?'
+            `SELECT m.id, m.content FROM messages m WHERE ${CLEANABLE} ORDER BY m.created_at ASC LIMIT ?`
           ).all(deleteCount);
           const oldestIds = oldestRows.map(r => r.id);
           const trimmedAttachments = new Set();
@@ -164,6 +164,14 @@ module.exports = function registerMaintenance(deps) {
         let orphansDeleted = 0;
         for (const ch of orphanRows) {
           try {
+            // A DM holding protected messages stays, and only the rest of
+            // it goes. Their files stay where they are.
+            if (protectedMessages.protectedCount(db, [ch.id])) {
+              if (db.prepare(`SELECT 1 FROM messages m WHERE m.channel_id = ? AND ${protectedMessages.deletableSql('m')} LIMIT 1`).get(ch.id)) {
+                protectedMessages.keepChannel(db, ch, 'orphaned DM');
+              }
+              continue;
+            }
             // Move any /uploads/<file> referenced in this DM's messages to
             // deleted-attachments first so file cleanup doesn't lose track.
             const msgs = db.prepare('SELECT content FROM messages WHERE channel_id = ?').all(ch.id);
@@ -329,11 +337,12 @@ module.exports = function registerMaintenance(deps) {
     }
   });
 
+  // Downloaded with a one-time ticket (POST /api/admin/download-ticket),
+  // not the session token in the URL.
   app.get('/api/admin/auto-backups/:name', (req, res) => {
-    const token = req.query.token || req.headers.authorization?.split(' ')[1];
-    const user = token ? verifyToken(token) : null;
-    if (!user) return res.status(401).json({ error: 'Unauthorized' });
-    if (!verifyAdminFromDb(user)) return res.status(403).json({ error: 'Admin only' });
+    const entry = takeTicket(req.query.ticket, 'auto-backup');
+    if (!entry || entry.data.name !== req.params.name) return res.status(401).json({ error: 'This download link has expired. Try again.' });
+    if (!verifyAdminFromDb({ id: entry.userId })) return res.status(403).json({ error: 'Admin only' });
     const name = req.params.name;
     // Path traversal guard: backups are flat zip files only.
     if (!/^[\w.-]+\.zip$/.test(name)) return res.status(400).json({ error: 'Invalid name' });
@@ -397,8 +406,11 @@ module.exports = function registerMaintenance(deps) {
   // Detects how Haven was installed and returns the right command (or runs it).
   // Docker is intentionally NOT auto-runnable from inside the container; we just
   // surface the right command for the operator to run on the host.
+  // The code folder, which is where the updater works, whatever folder Haven
+  // was started from.
+  const CODE_DIR = path.resolve(__dirname, '..', '..');
   function detectInstallMethod() {
-    const cwd = process.cwd();
+    const cwd = CODE_DIR;
     const inDocker = fs.existsSync('/.dockerenv') || process.env.HAVEN_IN_DOCKER === 'true';
     if (inDocker) return 'docker';
     if (fs.existsSync(path.join(cwd, '.git'))) return 'git';
@@ -416,18 +428,18 @@ module.exports = function registerMaintenance(deps) {
       };
       case 'git': return {
         runnable: true,
-        command: 'git pull --ff-only && npm install --omit=dev',
-        message: 'Pull latest from GitHub and reinstall dependencies. The server will exit after the update so your supervisor (systemd / Docker / installer service) restarts it on the new code.',
+        mode: 'git',
+        command: 'node scripts/update.js git',
+        message: 'Haven pulls the latest code from GitHub, reinstalls dependencies and starts again. It is offline for a minute or two; this page reconnects by itself.',
       };
-      case 'windows-installer': return {
-        runnable: true,
-        command: '"Install Haven.bat" /update',
-        message: 'Re-run the Windows installer in update mode. The server will exit so the installer can replace files and restart the service.',
-      };
+      // Install Haven.bat, install.sh and release zips have no git history, so
+      // the updater downloads the latest release and copies it over the code.
+      case 'windows-installer':
       case 'shell-installer': return {
         runnable: true,
-        command: 'bash install.sh --update',
-        message: 'Re-run the install script in update mode. The server will exit so the installer can refresh files and restart the service.',
+        mode: 'release',
+        command: 'node scripts/update.js release',
+        message: 'Haven downloads the latest release, installs it and starts again. It is offline for a minute or two; this page reconnects by itself. Your data folder is not touched.',
       };
       default: return {
         runnable: false,
@@ -437,7 +449,7 @@ module.exports = function registerMaintenance(deps) {
   }
 
   app.get('/api/admin/update/check', async (req, res) => {
-    const token = req.query.token || req.headers.authorization?.split(' ')[1];
+    const token = req.headers.authorization?.split(' ')[1];
     const user = token ? verifyToken(token) : null;
     if (!user) return res.status(401).json({ error: 'Unauthorized' });
     if (!verifyAdminFromDb(user)) return res.status(403).json({ error: 'Admin only' });
@@ -494,27 +506,41 @@ module.exports = function registerMaintenance(deps) {
 
     res.json({ ok: true, method, message: instructions.message });
 
-    // Run the update command in a detached child process so the parent can exit cleanly.
+    // scripts/update.js does the work and writes to update.log in the data
+    // folder. Under systemd or pm2 it updates in place and Haven exits after it,
+    // so the service manager starts the new code. Otherwise Haven exits first,
+    // which frees files Windows keeps locked while they are loaded (the SQLite
+    // module), and the script starts Haven again when it is done.
     const { spawn } = require('child_process');
-    console.log(`🔄 [Update] Running update command for method=${method}: ${instructions.command}`);
+    const supervised = !!(process.env.INVOCATION_ID || process.env.pm_id || process.env.HAVEN_SUPERVISED === 'true');
+    const updArgs = [path.join(CODE_DIR, 'scripts', 'update.js'), instructions.mode, '--port', String(process.env.PORT || 3000)];
+    if (supervised) updArgs.push('--no-restart');
+    else updArgs.push('--wait-pid', String(process.pid));
+    const shutdown = () => {
+      console.log('🔄 [Update] Exiting so the updated Haven can start…');
+      late.botAudioManager?.shutdown();
+      process.exit(0);
+    };
+    console.log(`🔄 [Update] Updating (${method}), log: ${path.join(DATA_DIR, 'update.log')}`);
     setTimeout(() => {
+      let child;
       try {
-        const child = spawn(instructions.command, {
-          cwd: process.cwd(),
-          shell: true,
-          detached: true,
-          stdio: 'ignore',
-        });
-        child.unref();
+        const logFd = fs.openSync(path.join(DATA_DIR, 'update.log'), 'a');
+        child = spawn(process.execPath, updArgs, { cwd: CODE_DIR, detached: !supervised, windowsHide: true, stdio: ['ignore', logFd, logFd] });
+        fs.closeSync(logFd);
       } catch (err) {
-        console.error('[Update] Failed to spawn update command:', err);
+        console.error('[Update] Could not start the updater, so Haven keeps running:', err);
+        return;
       }
-      // Give the child a moment to start, then exit so the supervisor restarts us.
-      setTimeout(() => {
-        console.log('🔄 [Update] Exiting so supervisor restarts on new code…');
-        late.botAudioManager?.shutdown();
-        process.exit(0);
-      }, 1500);
+      if (supervised) {
+        child.on('exit', (code) => {
+          if (code === 0) return shutdown();
+          console.error(`[Update] Update failed (exit ${code}), so Haven keeps running. See update.log.`);
+        });
+      } else {
+        child.unref();
+        setTimeout(shutdown, 1500);
+      }
     }, 1500);
   });
 

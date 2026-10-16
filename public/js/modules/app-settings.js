@@ -81,8 +81,10 @@ _bindSettings() {
     const adminNav = document.querySelector('.settings-nav-admin-group');
     const saveBar = document.querySelector('.admin-save-bar');
 
-    document.querySelectorAll('.settings-tab').forEach(t => t.classList.remove('active'));
-    document.querySelector(`.settings-tab[data-tab="${tab}"]`)?.classList.add('active');
+    // Only the Settings modal's own tabs: plugins reuse the settings-tab
+    // look for buttons of their own (Channel Tabs, #5786).
+    document.querySelectorAll('#settings-tab-bar .settings-tab').forEach(t => t.classList.remove('active'));
+    document.querySelector(`#settings-tab-bar .settings-tab[data-tab="${tab}"]`)?.classList.add('active');
 
     if (tab === 'admin') {
       // Defensive gate: refuse switching to the admin tab if the user has no
@@ -111,7 +113,7 @@ _bindSettings() {
     }
   };
 
-  document.querySelectorAll('.settings-tab').forEach(tab => {
+  document.querySelectorAll('#settings-tab-bar .settings-tab').forEach(tab => {
     tab.addEventListener('click', () => {
       this._switchSettingsTab(tab.dataset.tab);
     });
@@ -432,6 +434,8 @@ _bindSettings() {
     totpSetupArea.style.display = 'block';
     if (totpSetupStatus) { totpSetupStatus.textContent = ''; totpSetupStatus.className = 'settings-hint'; }
     document.getElementById('totp-verify-code').value = '';
+    const pwField = document.getElementById('totp-setup-password');
+    if (pwField) pwField.value = '';
 
     try {
       const res = await fetch('/api/auth/totp/setup', {
@@ -485,11 +489,12 @@ _bindSettings() {
       if (totpSetupStatus) totpSetupStatus.textContent = t('settings.two_factor_section.verify_prompt');
       return;
     }
+    const password = document.getElementById('totp-setup-password')?.value || '';
     try {
       const res = await fetch('/api/auth/totp/verify-setup', {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${this.token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code })
+        body: JSON.stringify({ code, password })
       });
       const data = await res.json();
       if (!res.ok) {
@@ -905,8 +910,8 @@ _setupE2EPassphraseSection() {
         // key nobody can reproduce.
         const res = await fetch('/api/auth/verify-password', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: this.user.username, password })
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${this.token}` },
+          body: JSON.stringify({ password })
         });
         const data = await res.json().catch(() => ({}));
         if (!data.valid) return say(t('settings.e2e_passphrase.wrong_password'), 'error');

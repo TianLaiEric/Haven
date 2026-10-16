@@ -420,12 +420,12 @@ window.HavenPluginLoader = (function () {
       }
       return;
     }
-    const configured = getEnabledThemes().includes(meta.file);
-    // A published theme is only injected when it is the selected one; leaving a
-    // previously-selected one in the enabled list must not stack it on top of
-    // whatever theme is active now.
-    const shouldInject = configured && compatible && !suppressExtensions
+    // A published or palette theme is only on when it is the selected one;
+    // leaving a previously-selected one in the enabled list must not stack it
+    // on top of whatever theme is active now, or tick its Settings toggle.
+    const configured = getEnabledThemes().includes(meta.file)
       && (!isExclusiveMeta({ ...meta, file: meta.file }) || getActiveFileTheme() === meta.file);
+    const shouldInject = configured && compatible && !suppressExtensions;
     let linkEl = null;
     if (shouldInject) {
       linkEl = document.createElement('link');
@@ -448,8 +448,10 @@ window.HavenPluginLoader = (function () {
     if (!t || t.enabled || suppressExtensions || !t.compatible) return;
     // A published theme is one of the picker's choices, not a stackable tweak:
     // turning it on means selecting it, so the two surfaces stay in agreement.
+    // The account's saved theme has to follow, the same as a picker click,
+    // or the server's older choice replaces this one on the next load.
     if (isExclusiveMeta({ ...t.meta, file })) {
-      applyFileTheme(file);
+      if (applyFileTheme(file)) void persistThemePreference(`file:${file}`);
       return;
     }
     t.enabled = true;
