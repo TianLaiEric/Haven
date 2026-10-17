@@ -16,8 +16,9 @@ _formatContent(str) {
   // it blurred behind a "Spoiler" overlay; a click reveals it (handled by the
   // delegated reveal listener). Only treat as a spoiler when the payload is
   // actually media so a plain text message that happens to start with the
-  // marker isn't blurred unexpectedly.
-  if (typeof str === 'string' && str.startsWith('spoiler-img:')) {
+  // marker isn't blurred unexpectedly. One line only: pictures sent together
+  // (#5799) can start with a spoiler and are laid out further down.
+  if (typeof str === 'string' && str.startsWith('spoiler-img:') && !str.includes('\n')) {
     const rest = str.slice('spoiler-img:'.length);
     if (this._isImageUrl(rest) || /^\/uploads\//i.test(rest) || rest.startsWith('e2e-img:')) {
       const inner = this._formatContent(rest);
@@ -37,7 +38,7 @@ _formatContent(str) {
   // E2E encrypted file: e2e-file:{"mime":...,"size":N,"url":"/uploads/...","name":"..."}
   // (#5310, #5308): non-image DM uploads, plus paste-into-PiP, are encrypted
   // before upload and the metadata is wrapped in this marker.
-  if (str.startsWith('e2e-file:')) {
+  if (str.startsWith('e2e-file:') && !str.includes('\n')) {
     try {
       const meta = JSON.parse(str.slice(9));
       if (meta && typeof meta.url === 'string' && meta.url.startsWith('/uploads/')) {
@@ -68,9 +69,14 @@ _formatContent(str) {
   // of those lines shows as the picture or file, and the text around them
   // formats as usual; the link used to print as plain text (#5690, #5689).
   // Only this server's uploads, and never inside a code block.
+  // Pictures and files sent together use the same form (#5799), encrypted DM
+  // ones included, and two or more pictures or videos in a row show as one
+  // grid (app-media-grid.js). A blog post keeps one piece per file, so it
+  // turns the grid off while its post is drawn.
   if (typeof str === 'string' && str.includes('\n') && !str.includes('```')) {
     const mediaLine = (l) => /^(?:spoiler-img:)?\/uploads\/(?:[\w\-]+\/)?[\w\-.]+\.(jpg|jpeg|png|gif|webp|svg)$/i.test(l) ||
-      /^\[file:[^\]\n]+\]\(\/uploads\/[^\s|)]+\|[^)\n]+\)$/.test(l);
+      /^\[file:[^\]\n]+\]\(\/uploads\/[^\s|)]+\|[^)\n]+\)$/.test(l) ||
+      this._mediaGridKind?.(l) === 'image' || /^e2e-file:\{.*\}$/.test(l);
     const lines = str.split('\n');
     if (lines.some(l => mediaLine(l.trim()))) {
       const parts = [];
@@ -80,9 +86,17 @@ _formatContent(str) {
         text = [];
         if (chunk.trim()) parts.push(`<div class="content-text-part">${this._formatContent(chunk)}</div>`);
       };
-      for (const l of lines) {
-        if (mediaLine(l.trim())) { flush(); parts.push(`<div class="content-media-part">${this._formatContent(l.trim())}</div>`); }
-        else text.push(l);
+      for (let i = 0; i < lines.length; i++) {
+        const l = lines[i];
+        if (!mediaLine(l.trim())) { text.push(l); continue; }
+        flush();
+        const run = this._mediaGridOff ? [] : (this._mediaGridRun?.(lines, i) || []);
+        if (run.length >= 2) {
+          parts.push(this._mediaGridHtml(run));
+          i += run.length - 1;
+          continue;
+        }
+        parts.push(`<div class="content-media-part">${this._formatContent(l.trim())}</div>`);
       }
       flush();
       return parts.join('');
@@ -781,15 +795,12 @@ _updateMessageReactions(messageId, reactions) {
   const els = document.querySelectorAll(`[data-msg-id="${messageId}"]`);
   if (!els.length) return;
 
+  // A reader at the bottom of the chat, a thread or the DM window stays
+  // there while the row grows the message, and again when a custom emoji in
+  // it loads: the feed anchor (app-feed-anchor.js) sees every change in a
+  // message's height.
   const wasAtBottom = this._coupledToBottom;
   const html = this._renderReactions(messageId, reactions);
-  // A message whose bottom edge was on screen keeps it there when the row
-  // grows it, so a reaction on a message at the bottom of the chat is not
-  // left under the message box (the feed is not always counted as at the
-  // bottom, and a custom emoji in the row grows it again when it loads).
-  const box = document.getElementById('messages');
-  const main = box ? box.querySelector(`[data-msg-id="${messageId}"]`) : null;
-  const keep = !!main && !wasAtBottom && this._messageBottomVisible(main);
 
   els.forEach((msgEl) => {
     const oldRow = msgEl.querySelector('.reactions-row');
@@ -800,41 +811,6 @@ _updateMessageReactions(messageId, reactions) {
   });
 
   if (wasAtBottom) this._scrollToBottom(true);
-  else if (keep) this._revealMessageBottom(main);
-  if (main && (wasAtBottom || keep)) {
-    main.querySelectorAll('.reactions-row img').forEach(img => {
-      if (img.complete) return;
-      img.addEventListener('load', () => {
-        if (this._coupledToBottom) this._scrollToBottom(true);
-        else this._revealMessageBottom(main);
-      }, { once: true });
-    });
-  }
-},
-
-// The visible bottom of the chat: the feed's own edge, or the top of the
-// message box where a layout lets it overlap the feed.
-_feedVisibleBottom() {
-  const box = document.getElementById('messages');
-  if (!box) return 0;
-  let bottom = box.getBoundingClientRect().bottom;
-  const input = document.querySelector('.message-input-area');
-  if (input && input.offsetParent) bottom = Math.min(bottom, input.getBoundingClientRect().top);
-  return bottom;
-},
-
-_messageBottomVisible(el) {
-  const box = document.getElementById('messages');
-  if (!box || !el) return false;
-  const r = el.getBoundingClientRect();
-  return r.bottom > box.getBoundingClientRect().top && r.bottom <= this._feedVisibleBottom() + 4;
-},
-
-_revealMessageBottom(el) {
-  const box = document.getElementById('messages');
-  if (!box || !el || !el.isConnected) return;
-  const over = el.getBoundingClientRect().bottom - this._feedVisibleBottom();
-  if (over > 0) box.scrollTop += over + 6;
 },
 
 // ═══════════════════════════════════════════════════════
@@ -844,9 +820,17 @@ _revealMessageBottom(el) {
 // The text a reply line shows for a message: pictures and files by a short
 // label, not the address they are stored under (an encrypted picture's
 // "e2e-img:image/png:/uploads/..." used to show as it was).
+// Several pictures in a row read as one count, not a label each (#5799).
 _replyPreviewText(content) {
-  return String(content || '').split('\n').map(l => l.trim()).filter(Boolean).map(l => {
-    if (this._isImageUrl(l) || /^\/uploads\/\S+$/i.test(l)) return `🖼️ ${t('messages.preview_picture')}`;
+  const isPicture = (l) => this._isImageUrl(l) || /^\/uploads\/\S+$/i.test(l);
+  const lines = String(content || '').split('\n').map(l => l.trim()).filter(Boolean);
+  return lines.map((l, i) => {
+    if (isPicture(l)) {
+      if (i > 0 && isPicture(lines[i - 1])) return null;
+      let n = 1;
+      while (i + n < lines.length && isPicture(lines[i + n])) n++;
+      return n > 1 ? `🖼️ ${t('messages.preview_pictures', { count: n })}` : `🖼️ ${t('messages.preview_picture')}`;
+    }
     const file = /^\[file:([^\]]*)\]\(/.exec(l);
     if (file) return `📎 ${file[1] || t('messages.preview_file')}`;
     if (l.startsWith('e2e-file:')) {
@@ -855,7 +839,7 @@ _replyPreviewText(content) {
       return `📎 ${name || t('messages.preview_file')}`;
     }
     return l;
-  }).join(' ');
+  }).filter(l => l !== null).join(' ');
 },
 
 _renderReplyBanner(replyCtx) {
@@ -981,6 +965,9 @@ _startEditMessage(msgEl, msgId) {
   // 1) markdown formatting stripped (bold/italic/etc. lost)
   // 2) '(edited)' tag text leaked into the textarea on repeated edits.
   const rawText = msgEl.dataset.rawContent ?? contentEl.textContent;
+  // Pictures sent together (#5799): only the text is edited, and the
+  // pictures go back under it unchanged.
+  const grouped = this._mediaGroupSplit?.(rawText) || null;
 
   // Replace content with an editable textarea
   const originalHtml = contentEl.innerHTML;
@@ -989,7 +976,7 @@ _startEditMessage(msgEl, msgId) {
 
   const textarea = document.createElement('textarea');
   textarea.className = 'edit-textarea';
-  textarea.value = rawText;
+  textarea.value = grouped ? grouped.text : rawText;
   textarea.rows = 1;
   textarea.maxLength = parseInt(this.serverSettings?.max_message_chars) || 2000;
   // The same drag bar the composer has, so a long message can be pulled
@@ -1044,6 +1031,7 @@ _startEditMessage(msgEl, msgId) {
     e.stopPropagation();
     e.preventDefault();
     let newContent = textarea.value.trim();
+    if (grouped) newContent = [newContent, ...grouped.media].filter(Boolean).join('\n');
     if (!newContent) {
       // Discord-style: clearing the whole message and confirming the edit
       // offers to delete the message rather than silently cancelling it.

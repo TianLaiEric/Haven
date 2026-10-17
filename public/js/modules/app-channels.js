@@ -14,6 +14,7 @@ async switchChannel(code) {
   // Voice persists across channel switches, no auto-disconnect
 
   this.currentChannel = code;
+  this._typingRender?.();
   // Search panel persists per-context: hide/show it for the channel we just
   // entered (public channels share one, each DM keeps its own). (search-overhaul)
   this._searchOnChannelSwitch?.();
@@ -109,6 +110,7 @@ async switchChannel(code) {
   // so a server-built list of it would have nothing readable to show.
   const _threadsBtn = document.getElementById('threads-toggle-btn');
   if (_threadsBtn) _threadsBtn.style.display = isDm ? 'none' : '';
+  this._updateThreadsButtonBadge?.();
   // Auto-close pinned panel and Pins PiP on channel switch so stale pins don't linger
   document.getElementById('pinned-panel').style.display = 'none';
   this._closePinsPiP?.();
@@ -119,8 +121,10 @@ async switchChannel(code) {
     const canMove = !isDm && (this.user.isAdmin || this._canModerate());
     moveSelectBtn.style.display = canMove ? 'inline-flex' : 'none';
   }
-  // Exit selection mode when switching channels
-  if (this._moveSelectionActive) this._exitMoveSelectionMode();
+  // Exit selection mode when switching channels, unless picking a message
+  // there to put the selection under (app-move-to-thread.js).
+  if (this._moveSelectionActive && !this._moveThreadKeepsSelection?.(code)) this._exitMoveSelectionMode();
+  else if (this._moveSelectionActive) this._syncMoveThreadUi?.();
 
   // Show/hide topic bar. DMs don't have topics; showing the placeholder
   // overlaps the E2E encryption dropdown that lives in the same header.
@@ -1202,6 +1206,8 @@ _renderChannels() {
   this._updateNestedIndicators();
   // Forum dots are drawn apart from the counts above (app-forum-unread.js).
   Object.keys(this.forumUnread || {}).forEach(code => this._updateForumDot?.(code));
+  // So are the dots for news in threads you take part in (app-thread-unread.js).
+  this._paintThreadDots?.();
 },
 
 // ── Keyboard Navigation ──────────────────────────────────

@@ -7,6 +7,11 @@ const { generateConnectToken } = require('../auth');
 const { setEnvValue, clearEnvValue, isWritableKey } = require('../envStore');
 const { saveFcmToken } = require('../fcm');
 const { validHighScore, isKnownGame } = require('../highScores');
+const { badgesForProfile } = require('../badges');
+const { themePreferenceAllowed } = require('../themeMetadata');
+const { MEDIA_GROUP_LAYOUTS } = require('../mediaGroup');
+
+const PUSH_SCOPES = ['all', 'mentions'];
 
 // A personal sidebar order (#5779): category keys and, per category, channel
 // codes. Only that shape is kept, within limits, so the value cannot carry
@@ -351,6 +356,16 @@ module.exports = function register(socket, ctx) {
       const hidden = row.status === 'invisible' && data.userId !== socket.user.id;
       if (hidden) isOnline = false;
 
+      // Badges (#5632) are worked out here, when a card opens, and nowhere
+      // else, so member lists never pay for them. A card without its badges
+      // still beats no card.
+      let badges = [];
+      try {
+        badges = badgesForProfile(db, row.id, socket.user.id);
+      } catch (err) {
+        console.warn('[badges] profile badges failed:', err.message);
+      }
+
       socket.emit('user-profile', {
         id: row.id,
         username: row.username,
@@ -367,6 +382,7 @@ module.exports = function register(socket, ctx) {
         // null while they hide their birthday.
         birthday: row.birthday || null,
         roles: roles,
+        badges,
         online: isOnline,
         createdAt: row.created_at,
         // Profile card shows game AND music on separate lines; the sidebar
@@ -479,6 +495,10 @@ module.exports = function register(socket, ctx) {
           VALUES (?, ?, ?, ?)
           ON CONFLICT(user_id, endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth
         `).run(socket.user.id, endpoint, keys.p256dh, keys.auth);
+        if (PUSH_SCOPES.includes(data.scope)) {
+          db.prepare('UPDATE push_subscriptions SET scope = ? WHERE user_id = ? AND endpoint = ?')
+            .run(data.scope, socket.user.id, endpoint);
+        }
         // Ten devices per person is plenty; the oldest go first. Without a cap
         // one account could register endless endpoints for the push queue.
         db.prepare(`
@@ -519,9 +539,28 @@ module.exports = function register(socket, ctx) {
       // cleans itself up.
       // saveFcmToken claims the token for this account and applies the
       // length and per-account caps.
-      saveFcmToken(db, socket.user.id, data.token.trim());
+      saveFcmToken(db, socket.user.id, data.token.trim(), data.scope);
     } catch (err) {
       console.error('FCM token register error:', err);
+    }
+  });
+
+  // Which messages this device is pushed: 'all', or 'mentions' while its
+  // Notifications switch (Settings > Sounds) is off, so push follows the same
+  // choice as the device's sounds and pop-ups. Only the caller's own rows.
+  socket.on('set-push-scope', (data) => {
+    if (!data || typeof data !== 'object' || !PUSH_SCOPES.includes(data.scope)) return;
+    try {
+      if (typeof data.endpoint === 'string' && data.endpoint) {
+        db.prepare('UPDATE push_subscriptions SET scope = ? WHERE user_id = ? AND endpoint = ?')
+          .run(data.scope, socket.user.id, data.endpoint);
+      }
+      if (typeof data.token === 'string' && data.token.trim()) {
+        db.prepare('UPDATE fcm_tokens SET scope = ? WHERE user_id = ? AND token = ?')
+          .run(data.scope, socket.user.id, data.token.trim());
+      }
+    } catch (err) {
+      console.error('Push scope update error:', err);
     }
   });
 
@@ -673,6 +712,27 @@ module.exports = function register(socket, ctx) {
     socket.emit('preferences', prefs);
   });
 
+  // Whether this account may save a theme file as its theme. Every failure
+  // counts against it: no permission, nothing published.
+  const themeFileAllowed = (value) => {
+    let canManage = false;
+    try {
+      canManage = !!(socket.user.isAdmin || userHasPermission(socket.user.id, 'manage_server'));
+    } catch (err) {
+      console.warn('[preferences] permission check failed:', err.message);
+    }
+    const setting = (name) => db.prepare('SELECT value FROM server_settings WHERE key = ?').get(name)?.value || '';
+    let published = [];
+    try {
+      published = JSON.parse(setting('published_themes') || '[]');
+    } catch {
+      // A malformed list publishes nothing; the picker reads it the same way.
+    }
+    const current = db.prepare("SELECT value FROM user_preferences WHERE user_id = ? AND key = 'theme'")
+      .get(socket.user.id)?.value || '';
+    return themePreferenceAllowed(value, { published, current, defaultTheme: setting('default_theme'), canManage });
+  };
+
   socket.on('set-preference', (data) => {
     if (!data || typeof data !== 'object') return;
     const key = typeof data.key === 'string' ? data.key.trim() : '';
@@ -704,6 +764,9 @@ module.exports = function register(socket, ctx) {
       // Muting, for yourself (app-server-mute.js): this server ('all' or
       // 'mentions') and members muted for you (a JSON list of user ids).
       'server_mute', 'muted_users',
+      // How pictures sent together show for you (#5799): 'grid' or
+      // 'stacked'. No row follows the server's media_group_layout.
+      'media_group_layout',
     ];
     // 'effects' is a JSON array of effect ids, longer than the other values.
     // A theme is saved as file:<file name>, and a community theme's file name
@@ -716,6 +779,14 @@ module.exports = function register(socket, ctx) {
       if (!stored) return;
     }
     if (key === 'server_mute' && value !== 'all' && value !== 'mentions') return;
+    if (key === 'media_group_layout' && !MEDIA_GROUP_LAYOUTS.includes(value)) return;
+    // Members pick from Haven's own themes and the published theme files. A
+    // refusal is quiet: the picker only offers allowed themes, so this is a
+    // stale list or a crafted request, and the client falls back on its own.
+    if (key === 'theme' && value.startsWith('file:') && !themeFileAllowed(value)) {
+      socket.emit('preference-refused', { key, value });
+      return;
+    }
     if (key === 'muted_users') {
       let ids;
       try { ids = JSON.parse(value); } catch { return; } // not JSON: refused
@@ -747,7 +818,7 @@ module.exports = function register(socket, ctx) {
   socket.on('delete-preference', (data) => {
     if (!data || typeof data !== 'object') return;
     const key = typeof data.key === 'string' ? data.key.trim() : '';
-    const deletableKeys = ['timezone', 'time_format', 'channel_order', 'server_mute', 'muted_users'];
+    const deletableKeys = ['timezone', 'time_format', 'channel_order', 'server_mute', 'muted_users', 'media_group_layout'];
     if (!deletableKeys.includes(key)) return;
     db.prepare('DELETE FROM user_preferences WHERE user_id = ? AND key = ?').run(socket.user.id, key);
     socket.emit('preference-deleted', { key });

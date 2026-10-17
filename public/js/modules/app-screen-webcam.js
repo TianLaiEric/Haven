@@ -114,7 +114,11 @@ _handleWebcamStream(userId, stream) {
       const vid = document.createElement('video');
       vid.autoplay = true;
       vid.playsInline = true;
-      vid.muted = (userId === this.user.id); // mute own cam to avoid echo
+      // Always muted: a camera carries no sound (voice plays on its own), and
+      // an unmuted video may not start without a tap where autoplay needs a
+      // gesture, as in the Android app, so cameras stayed black until a
+      // reconnect.
+      vid.muted = true;
       // Mirror own camera (like a mirror), but show others normally
       if (userId === this.user.id) {
         vid.style.transform = 'scaleX(-1)';
@@ -517,7 +521,16 @@ _handleScreenStream(userId, stream, { force = false } = {}) {
       this._pendingStreamOffers.set(userId, stream);
       this._showToast(t('voice.sharing_started', { who }), 'info', {
         label: t('voice_runtime.join'),
-        onClick: () => this._handleScreenStream(userId, stream, { force: true })
+        onClick: () => {
+          // The prompt outlives the share: once it has ended (or a newer one
+          // took its place) Join opened an empty tile with its controls and
+          // no picture. Only the share still on offer opens.
+          if (this._pendingStreamOffers?.get(userId) !== stream) {
+            this._showToast(t('voice.sharing_ended', { who }), 'info');
+            return;
+          }
+          this._handleScreenStream(userId, stream, { force: true });
+        }
       }, 8000);
       return;
     }

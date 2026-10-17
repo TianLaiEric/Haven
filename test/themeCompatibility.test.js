@@ -90,8 +90,8 @@ function browserCompat(localStorage, sessionStorage) {
   };
 }
 
-function runThemeInit({ theme = 'file:test.theme.css', search = '', cache = [], themes } = {}) {
-  const localStorage = new MemoryStorage({ haven_theme: theme });
+function runThemeInit({ theme = 'file:test.theme.css', search = '', cache = [], themes, stored = {} } = {}) {
+  const localStorage = new MemoryStorage({ haven_theme: theme, ...stored });
   const sessionStorage = new MemoryStorage();
   ThemeCompat.cacheThemes(cache, localStorage);
   const { document, documentElement, links } = createDocument();
@@ -181,6 +181,9 @@ async function runPluginLoader({
   search = '',
   socket = null,
   recoveryPending = false,
+  // 'admin' or 'member' puts the app on the page with that viewer; without
+  // one the app has not started yet.
+  viewer = null,
 } = {}) {
   const localStorage = new MemoryStorage({
     haven_theme: theme,
@@ -200,6 +203,7 @@ async function runPluginLoader({
     addEventListener() {},
     havenSocket: socket,
   };
+  if (viewer) window.app = { _canPublishThemes: () => viewer === 'admin' };
   if (withCompat) window.HavenThemeCompat = browserCompat(localStorage, sessionStorage);
   let themeFetchCount = 0;
   const fetch = async url => {
@@ -245,6 +249,7 @@ async function runPluginLoader({
   await new Promise(resolve => setImmediate(resolve));
   return {
     api: window.HavenApi,
+    document,
     documentElement,
     fetches,
     links,
@@ -349,6 +354,7 @@ test('theme metadata parser preserves existing fields and exposes compatibility'
     compatibility: 'compatible',
     compatible: true,
     palette: false,
+    swatch: null,
   });
 });
 
@@ -561,6 +567,28 @@ test('safe mode suppresses compatible theme CSS before paint', () => {
   assert.equal(result.documentElement.attributes.get('data-haven-safe-mode'), '1');
 });
 
+test('pre-paint loader restores the light or dark scheme theme.js last measured', () => {
+  const light = runThemeInit({ theme: 'daylight', stored: { haven_color_scheme: 'light' } });
+  assert.equal(light.documentElement.attributes.get('data-color-scheme'), 'light');
+
+  const file = runThemeInit({ stored: { haven_color_scheme: 'light' } });
+  assert.equal(file.documentElement.attributes.get('data-color-scheme'), 'light');
+
+  const junk = runThemeInit({ theme: 'daylight', stored: { haven_color_scheme: 'purple' } });
+  assert.equal(junk.documentElement.attributes.has('data-color-scheme'), false);
+});
+
+test('Haven, safe mode and a fresh account start from the dark default scheme', () => {
+  const haven = runThemeInit({ theme: 'haven', stored: { haven_color_scheme: 'light' } });
+  assert.equal(haven.documentElement.attributes.has('data-color-scheme'), false);
+
+  const safe = runThemeInit({ theme: 'daylight', search: '?haven-safe-mode=1', stored: { haven_color_scheme: 'light' } });
+  assert.equal(safe.documentElement.attributes.has('data-color-scheme'), false);
+
+  const fresh = runThemeInit({ theme: '', stored: { haven_color_scheme: 'light' } });
+  assert.equal(fresh.documentElement.attributes.has('data-color-scheme'), false);
+});
+
 test('safe mode never fetches or evaluates plugin files', async () => {
   const result = await runPluginLoader({
     safe: true,
@@ -719,6 +747,7 @@ test('turning a palette theme on in Settings saves it as the account theme', asy
   const result = await runPluginLoader({
     theme: 'matrix',
     socket,
+    viewer: 'admin',
     themes: [{
       file: 'neon.theme.css',
       published: false,
@@ -733,6 +762,116 @@ test('turning a palette theme on in Settings saves it as the account theme', asy
 
   assert.equal(result.localStorage.getItem('haven_theme'), 'file:neon.theme.css');
   assert.deepEqual(emitted, [JSON.stringify(['set-preference', { key: 'theme', value: 'file:neon.theme.css' }])]);
+});
+
+test('a member cannot turn on or pick an unpublished theme file', async () => {
+  for (const viewer of ['member', null]) {
+    const emitted = [];
+    const socket = { connected: true, on() {}, off() {}, emit(event, payload) { emitted.push([event, payload]); } };
+    const result = await runPluginLoader({
+      theme: 'matrix',
+      socket,
+      viewer,
+      themes: [
+        { file: 'neon.theme.css', published: false, palette: true, compatible: true, compatibility: 'compatible', themeApi: 1 },
+        { file: 'fonts.theme.css', published: false, palette: false, compatible: true, compatibility: 'legacy' },
+      ],
+    });
+
+    result.loader.enableTheme('neon.theme.css');
+    result.loader.enableTheme('fonts.theme.css');
+    assert.equal(result.loader.selectFileTheme('neon.theme.css'), false, `${viewer}: palette`);
+    assert.equal(result.loader.selectFileTheme('fonts.theme.css'), false, `${viewer}: tweak`);
+    assert.equal(result.localStorage.getItem('haven_theme'), 'matrix');
+    assert.equal(result.loader.loadedThemes.get('fonts.theme.css').enabled, false);
+    assert.equal(result.links.length, 0);
+    assert.deepEqual(emitted, []);
+  }
+});
+
+test('a member keeps an unpublished tweak they already had on, and can turn it off', async () => {
+  const result = await runPluginLoader({
+    theme: 'matrix',
+    viewer: 'member',
+    enabledThemes: ['fonts.theme.css'],
+    themes: [{ file: 'fonts.theme.css', published: false, palette: false, compatible: true, compatibility: 'legacy' }],
+  });
+  assert.equal(result.loader.loadedThemes.get('fonts.theme.css').enabled, true);
+  assert.equal(result.loader.selectFileTheme('fonts.theme.css'), true);
+  assert.equal(result.loader.loadedThemes.get('fonts.theme.css').enabled, false);
+  assert.equal(result.loader.selectFileTheme('fonts.theme.css'), false, 'not back on');
+});
+
+test('a theme the server refused falls back to Haven and saves that instead', async () => {
+  const emitted = [];
+  const socket = { connected: true, on() {}, off() {}, emit(event, payload) { emitted.push([event, payload?.value]); } };
+  const result = await runPluginLoader({
+    theme: 'file:neon.theme.css',
+    socket,
+    viewer: 'member',
+    themes: [{ file: 'neon.theme.css', published: true, palette: true, compatible: true, compatibility: 'compatible', themeApi: 1 }],
+  });
+  assert.equal(result.links.length, 1);
+
+  result.loader.onThemeRefused('file:other.theme.css');
+  assert.equal(result.localStorage.getItem('haven_theme'), 'file:neon.theme.css', 'a refusal for another theme changes nothing');
+
+  result.loader.onThemeRefused('file:neon.theme.css');
+  assert.equal(result.localStorage.getItem('haven_theme'), 'haven');
+  assert.equal(result.documentElement.attributes.get('data-theme'), 'haven');
+  assert.equal(result.loader.loadedThemes.get('neon.theme.css').enabled, false);
+  assert.deepEqual(emitted.filter(([event]) => event === 'set-preference'), [['set-preference', 'haven']]);
+});
+
+test('picking a published theme in the theme picker selects it and saves it to the account', async () => {
+  const emitted = [];
+  const socket = {
+    connected: true,
+    on() {},
+    off() {},
+    emit(event, payload) { emitted.push(JSON.stringify([event, payload])); },
+  };
+  const result = await runPluginLoader({
+    theme: 'matrix',
+    socket,
+    themes: [{ file: 'neon.theme.css', published: true, palette: true, compatible: true, compatibility: 'compatible', themeApi: 1 }],
+  });
+  let redraws = 0;
+  result.document.addEventListener('haven:themes-changed', () => { redraws++; });
+
+  assert.equal(result.loader.selectFileTheme('neon.theme.css'), true);
+  assert.equal(result.localStorage.getItem('haven_theme'), 'file:neon.theme.css');
+  assert.deepEqual(emitted, [JSON.stringify(['set-preference', { key: 'theme', value: 'file:neon.theme.css' }])]);
+  assert.ok(redraws > 0, 'the picker is told to redraw');
+
+  // Picking it again is not another save.
+  result.loader.selectFileTheme('neon.theme.css');
+  assert.equal(emitted.length, 1);
+});
+
+test('picking a theme that only adds CSS switches it on and off without changing the theme', async () => {
+  const result = await runPluginLoader({
+    theme: 'matrix',
+    viewer: 'admin',
+    themes: [{ file: 'fonts.theme.css', published: false, palette: false, compatible: true, compatibility: 'legacy' }],
+  });
+
+  result.loader.selectFileTheme('fonts.theme.css');
+  assert.equal(result.loader.loadedThemes.get('fonts.theme.css').enabled, true);
+  assert.equal(result.localStorage.getItem('haven_theme'), 'matrix');
+  result.loader.selectFileTheme('fonts.theme.css');
+  assert.equal(result.loader.loadedThemes.get('fonts.theme.css').enabled, false);
+  assert.equal(result.localStorage.getItem('haven_enabled_themes'), '[]');
+});
+
+test('safe mode refuses a theme picked in the theme picker', async () => {
+  const result = await runPluginLoader({
+    safe: true,
+    themes: [{ file: 'neon.theme.css', published: true, palette: true, compatible: true, compatibility: 'compatible', themeApi: 1 }],
+  });
+  assert.equal(result.loader.selectFileTheme('neon.theme.css'), false);
+  assert.equal(result.loader.suppressed, true);
+  assert.equal(result.links.length, 0);
 });
 
 test('a palette theme left in the enabled list is shown off while a built-in theme is active', async () => {

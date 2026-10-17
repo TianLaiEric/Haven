@@ -13,6 +13,13 @@
 // by the manage_tags permission (enforced by the caller via `canCreate`). New
 // tags are committed here on message send (get-or-create by normalized name),
 // never speculatively from the composer, so an abandoned draft leaves no orphans.
+//
+// A tag can be limited to a role (src/uploadTagRoles.js, #5751). Every path
+// that offers, applies or removes tags takes an `access` from tagAccess();
+// without one, restricted tags are left out, so a caller that forgets fails
+// closed.
+
+const { canUseTag, usableTagSql } = require('./uploadTagRoles');
 
 // Defaults, plus the hard technical ceilings the admin setting is clamped to.
 // The live values come from server_settings (max_tags_per_attachment,
@@ -20,7 +27,7 @@
 const MAX_TAG_LEN = 20;          // default; hard ceiling for the admin setting
 const MAX_TAG_LEN_CEIL = 50;
 const MAX_TAGS_PER_ATTACHMENT = 3;    // default; hard ceiling for the setting
-const MAX_TAGS_CEIL = 10;
+const MAX_TAGS_CEIL = 20;
 
 // Read the admin-configured limits from server_settings, clamped to the ceilings
 // above and falling back to the defaults. Tolerant: a missing table or bad value
@@ -66,6 +73,12 @@ function extractUploadPath(content) {
   return m ? m[0] : null;
 }
 
+// Every /uploads/<file> path a message names, in order, once each. Pictures
+// sent together share one message (#5799), and each keeps its own tags.
+function extractUploadPaths(content) {
+  return [...new Set(String(content || '').match(/\/uploads\/[^\s)|"'<>]+/g) || [])];
+}
+
 // Escape LIKE wildcards so a query of "50%" or "a_b" matches literally.
 function escapeLike(s) {
   return String(s).replace(/[\\%_]/g, ch => '\\' + ch);
@@ -75,19 +88,22 @@ function escapeLike(s) {
 // An empty query browses the whole vocabulary (the picker lists everything when
 // it first opens); a non-empty one is a prefix match, which stays on the UNIQUE
 // index and cheap. Both are capped so a huge vocabulary can't flood the popup.
-function searchTags(db, query, limit = 50) {
+// Tags limited to a role the searcher does not hold are left out (#5751).
+function searchTags(db, query, limit = 50, access = null) {
   const lim = Math.max(1, Math.min(100, limit | 0));
   const raw = String(query || '').trim();
+  const usable = usableTagSql(access);
   if (!raw) {
-    return db.prepare('SELECT id, name FROM upload_tags ORDER BY name_norm LIMIT ?').all(lim);
+    return db.prepare(`SELECT id, name FROM upload_tags WHERE 1 = 1${usable.sql} ORDER BY name_norm LIMIT ?`)
+      .all(...usable.params, lim);
   }
   const norm = normalizeTagName(raw);
   if (!norm) return [];
   return db.prepare(
     `SELECT id, name FROM upload_tags
-      WHERE name_norm LIKE ? ESCAPE '\\'
+      WHERE name_norm LIKE ? ESCAPE '\\'${usable.sql}
       ORDER BY name_norm LIMIT ?`
-  ).all(escapeLike(norm.norm) + '%', lim);
+  ).all(escapeLike(norm.norm) + '%', ...usable.params, lim);
 }
 
 // Attach `tagNames` to the file `content` carries, writing attachment_tags rows
@@ -113,14 +129,16 @@ function pickTags(tagNames, { maxTags = MAX_TAGS_PER_ATTACHMENT, maxLen = MAX_TA
 
 // Resolve `picked` tags to ids (minting unknown ones only when canCreate) and
 // link each to (messageId, relPath). Existing links are left alone (OR IGNORE).
+// A tag limited to a role `access` does not hold is skipped (#5751).
 // Caller owns the transaction. Returns the applied display names.
-function linkPickedTags(db, { messageId, relPath, picked, userId, canCreate }) {
-  const findTag   = db.prepare('SELECT id FROM upload_tags WHERE name_norm = ?');
+function linkPickedTags(db, { messageId, relPath, picked, userId, canCreate, access = null }) {
+  const findTag   = db.prepare('SELECT id, role_id FROM upload_tags WHERE name_norm = ?');
   const insertTag = db.prepare('INSERT INTO upload_tags (name, name_norm, created_by) VALUES (?, ?, ?)');
   const linkTag   = db.prepare('INSERT OR IGNORE INTO attachment_tags (message_id, rel_path, tag_id) VALUES (?, ?, ?)');
   const applied = [];
   for (const { name, norm } of picked) {
     let row = findTag.get(norm);
+    if (row && !canUseTag(access, row)) continue;
     if (!row) {
       if (!canCreate) continue;   // applying is open; creating needs manage_tags
       const res = insertTag.run(name, norm, userId || null);
@@ -132,31 +150,111 @@ function linkPickedTags(db, { messageId, relPath, picked, userId, canCreate }) {
   return applied;
 }
 
-function applyTagsToMessage(db, { messageId, content, tagNames, userId, canCreate, maxTags, maxLen }) {
+function applyTagsToMessage(db, { messageId, content, tagNames, userId, canCreate, maxTags, maxLen, access = null }) {
   const relPath = extractUploadPath(content);
   if (!relPath || !Array.isArray(tagNames) || !tagNames.length) return [];
   const picked = pickTags(tagNames, { maxTags, maxLen });
   if (!picked.length) return [];
   let applied = [];
   db.transaction(() => {
-    applied = linkPickedTags(db, { messageId, relPath, picked, userId, canCreate });
+    applied = linkPickedTags(db, { messageId, relPath, picked, userId, canCreate, access });
   })();
   return applied;
+}
+
+// Tags for each file of a message that carries several (#5799). `perFile` is
+// [{ url, tags }], one entry per file; only files the message itself names are
+// tagged, each up to the per-attachment cap. Returns every applied name once.
+function applyTagsToFiles(db, { messageId, content, perFile, userId, canCreate, maxTags, maxLen, access = null }) {
+  const paths = new Set(extractUploadPaths(content));
+  if (!paths.size || !Array.isArray(perFile)) return [];
+  const applied = new Set();
+  const done = new Set();
+  db.transaction(() => {
+    for (const entry of perFile.slice(0, 50)) {
+      const relPath = entry && typeof entry.url === 'string' ? entry.url : '';
+      if (!paths.has(relPath) || done.has(relPath)) continue;
+      done.add(relPath);
+      const picked = pickTags(entry.tags, { maxTags, maxLen });
+      if (!picked.length) continue;
+      for (const name of linkPickedTags(db, { messageId, relPath, picked, userId, canCreate, access })) applied.add(name);
+    }
+  })();
+  return [...applied];
+}
+
+// The tags on one file of a message, by name.
+function fileTags(db, messageId, relPath) {
+  return db.prepare(
+    `SELECT ut.name FROM attachment_tags at JOIN upload_tags ut ON ut.id = at.tag_id
+      WHERE at.message_id = ? AND at.rel_path = ? ORDER BY ut.name_norm`
+  ).all(messageId, relPath).map(r => r.name);
+}
+
+// Every tag on a message's files, once each.
+function messageTags(db, messageId) {
+  return [...new Set(db.prepare(
+    `SELECT ut.name FROM attachment_tags at JOIN upload_tags ut ON ut.id = at.tag_id
+      WHERE at.message_id = ? ORDER BY ut.name_norm`
+  ).all(messageId).map(r => r.name))];
 }
 
 // Replace the full tag set on a message's attachment (retroactive edit). Unlike
 // applyTagsToMessage this is not additive: it clears the message's existing
 // links first, so an empty list removes every tag. Returns the applied names.
-function setMessageTags(db, { messageId, content, tagNames, userId, canCreate, maxTags, maxLen }) {
-  const relPath = extractUploadPath(content);
-  if (!relPath) return [];
-  const picked = pickTags(tagNames, { maxTags, maxLen });
-  let applied = [];
+//
+// A message with several files (#5799) shows one set for all of them, so an
+// edit there is a change to that set: a tag taken off leaves every file, a new
+// one goes on every file (up to each file's cap), and the rest stay on the
+// files that had them. `relPath` names one of the files to replace only its
+// set, as the media gallery does. Returns the message's resulting set, or for
+// one file that file's set.
+function setMessageTags(db, { messageId, content, tagNames, userId, canCreate, maxTags, maxLen, relPath = null, access = null }) {
+  const paths = extractUploadPaths(content);
+  if (!paths.length) return [];
+  // A tag limited to a role this person does not hold stays where it is: they
+  // can neither put it on nor take it off (#5751).
+  const linksOf = db.prepare(
+    `SELECT at.rel_path, at.tag_id, ut.name_norm, ut.role_id FROM attachment_tags at JOIN upload_tags ut ON ut.id = at.tag_id
+      WHERE at.message_id = ?`
+  );
+  const drop = db.prepare('DELETE FROM attachment_tags WHERE message_id = ? AND rel_path = ? AND tag_id = ?');
+  if (relPath || paths.length === 1) {
+    const target = relPath || paths[0];
+    if (!paths.includes(target)) return [];
+    let applied = [];
+    let kept = 0;
+    db.transaction(() => {
+      const keptNorms = new Set();
+      for (const l of linksOf.all(messageId)) {
+        if (paths.length > 1 && l.rel_path !== target) continue;
+        if (canUseTag(access, l)) drop.run(messageId, l.rel_path, l.tag_id);
+        else { kept++; keptNorms.add(l.name_norm); }
+      }
+      const picked = pickTags(tagNames, { maxTags, maxLen })
+        .filter(p => !keptNorms.has(p.norm))
+        .slice(0, Math.max(0, maxTags - kept));
+      applied = linkPickedTags(db, { messageId, relPath: target, picked, userId, canCreate, access });
+    })();
+    return kept ? fileTags(db, messageId, target) : applied;
+  }
+  const picked = pickTags(tagNames, { maxTags: maxTags * paths.length, maxLen });
+  const keep = new Set(picked.map(p => p.norm));
   db.transaction(() => {
-    db.prepare('DELETE FROM attachment_tags WHERE message_id = ?').run(messageId);
-    applied = linkPickedTags(db, { messageId, relPath, picked, userId, canCreate });
+    const have = new Set();
+    for (const l of linksOf.all(messageId)) {
+      if (keep.has(l.name_norm)) have.add(l.name_norm);
+      else if (canUseTag(access, l)) drop.run(messageId, l.rel_path, l.tag_id);
+    }
+    const added = picked.filter(p => !have.has(p.norm));
+    if (!added.length) return;
+    const count = db.prepare('SELECT COUNT(*) AS n FROM attachment_tags WHERE message_id = ? AND rel_path = ?');
+    for (const path of paths) {
+      const room = Math.max(0, maxTags - count.get(messageId, path).n);
+      if (room) linkPickedTags(db, { messageId, relPath: path, picked: added.slice(0, room), userId, canCreate, access });
+    }
   })();
-  return applied;
+  return messageTags(db, messageId);
 }
 
 // ── Admin tag management (Phase 4) ──────────────────────────────────────────
@@ -166,10 +264,11 @@ function setMessageTags(db, { messageId, content, tagNames, userId, canCreate, m
 // association carries. messageTargetsForTag is the shared iteration both use to
 // tell the caller which messages changed, so it can rebroadcast live footers.
 
-// The full vocabulary with a usage count per tag, for the management list.
+// The full vocabulary with a usage count per tag and the role it is limited
+// to (roleId, null for anyone), for the management list.
 function listAllTags(db) {
   return db.prepare(
-    `SELECT ut.id, ut.name, COUNT(at.tag_id) AS uses
+    `SELECT ut.id, ut.name, ut.role_id AS roleId, COUNT(at.tag_id) AS uses
        FROM upload_tags ut
        LEFT JOIN attachment_tags at ON at.tag_id = ut.id
       GROUP BY ut.id
@@ -262,9 +361,13 @@ module.exports = {
   effectiveLimits,
   normalizeTagName,
   extractUploadPath,
+  extractUploadPaths,
   escapeLike,
   searchTags,
   applyTagsToMessage,
+  applyTagsToFiles,
+  fileTags,
+  messageTags,
   setMessageTags,
   listAllTags,
   messageTargetsForTag,

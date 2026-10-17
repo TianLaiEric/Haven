@@ -149,6 +149,8 @@ const {
 const { startTunnel, stopTunnel, getTunnelStatus, registerProcessCleanup } = require('./src/tunnel');
 const { startDdns, getDdnsStatus, triggerDdnsNow } = require('./src/ddns');
 const { initFcm, setFcmAdminEnabled } = require('./src/fcm');
+const threadNotify = require('./src/threadNotify');
+const { takeSilent } = require('./src/silentMessages');
 
 const app = express();
 const BOT_AUDIO_DIR = path.join(UPLOADS_DIR, 'bot-audio');
@@ -628,6 +630,7 @@ if (!sslCert && !sslKey) {
 }
 
 const useSSL = !!(sslCert && sslKey) && !forceHttp;
+let tlsIssue = null;
 
 app.use(helmet({
   contentSecurityPolicy: {
@@ -1434,7 +1437,8 @@ app.get('/api/public-config', (req, res) => {
       // login page never offers a button that can only fail. The issuer and
       // client id stay server-side; the client needs neither.
       oidc_enabled: oidcConfig.enabled,
-      oidc_button_label: oidcConfig.enabled ? oidcConfig.buttonLabel : ''
+      oidc_button_label: oidcConfig.enabled ? oidcConfig.buttonLabel : '',
+      tls_issue: tlsIssue
     });
   } catch {
     res.json({ default_theme: '', default_locale: '', server_title: '' });
@@ -1551,6 +1555,8 @@ require('./src/routes/uploads')({ uploadDiskGuard, app, recordUploadOwnership, u
 
 // ── Sounds, custom emoji and stickers: src/routes/media-library.js ──
 const { BUILTIN_SOUNDS, seedStarterStickers } = require('./src/routes/media-library')({ uploadDiskGuard, app, verifyAdminFromDb, userHasPermission, uploadDir, uploadStorage, uploadLimiter });
+// Profile badge icons (#5632): src/routes/badges.js
+require('./src/routes/badges')({ app, verifyAdminFromDb, userHasPermission, uploadDir, uploadLimiter, uploadDiskGuard });
 
 // ── GIF search proxy (GIPHY, KLIPY, or a legacy Tenor fallback) ──
 // Three providers are supported. preferred_gif_search picks which one to use
@@ -1874,7 +1880,10 @@ app.post('/api/webhooks/:token', webhookLimiter, express.json({ limit: '64kb' })
     return res.status(404).json({ error: 'Webhook not found or inactive' });
   }
 
-  const content = typeof req.body.content === 'string' ? sanitizeText(req.body.content.trim()) : '';
+  // A bot can post silently too: "silent": true, or "@silent" up front.
+  const silentPick = takeSilent(typeof req.body.content === 'string' ? req.body.content.trim() : '', req.body.silent);
+  const silent = silentPick.silent;
+  const content = sanitizeText(silentPick.content.trim());
   if (!content || content.length > 4000) {
     return res.status(400).json({ error: 'Content required (max 4000 chars)' });
   }
@@ -1965,6 +1974,7 @@ app.post('/api/webhooks/:token', webhookLimiter, express.json({ limit: '64kb' })
     ephemeral,
     recipient_id: recipientId,
     thread_id: threadId,
+    silent: silent || undefined,
   };
 
   if (ephemeral) {
@@ -1986,15 +1996,15 @@ app.post('/api/webhooks/:token', webhookLimiter, express.json({ limit: '64kb' })
 
   // Insert non-ephemeral messages into the DB/history.
   const result = db.prepare(
-    'INSERT INTO messages (channel_id, user_id, content, is_webhook, webhook_username, webhook_avatar, reply_to, thread_id, webhook_id) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)'
-  ).run(webhook.channel_id, null, content, username, avatarUrl || null, replyTo, threadId, webhook.id);
+    'INSERT INTO messages (channel_id, user_id, content, is_webhook, webhook_username, webhook_avatar, reply_to, thread_id, webhook_id, silent) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)'
+  ).run(webhook.channel_id, null, content, username, avatarUrl || null, replyTo, threadId, webhook.id, silent ? 1 : 0);
   message.id = result.lastInsertRowid;
 
   // Broadcast to all clients in this channel
   if (io && threadId) {
     // A thread reply: the same two events a person's thread reply sends.
     const code = webhook.channel_code;
-    io.to(`channel:${code}`).emit('new-thread-message', { channelCode: code, parentId: threadId, message });
+    io.to(`channel:${code}`).emit('new-thread-message', { channelCode: code, parentId: threadId, message, followerIds: threadNotify.followerIds(db, threadId) });
     const count = db.prepare('SELECT COUNT(*) AS count FROM messages WHERE thread_id = ?').get(threadId).count;
     const last = db.prepare('SELECT id, created_at FROM messages WHERE thread_id = ? ORDER BY created_at DESC, id DESC LIMIT 1').get(threadId);
     const participants = db.prepare(`
@@ -3138,6 +3148,15 @@ if (useSSL) {
     };
     server = createHttpsServer(sslOptions, app);
     console.log('🔒 HTTPS enabled');
+    try {
+      const { inspectCertChain, certAdvice } = require('./src/certCheck');
+      const status = inspectCertChain(sslOptions.cert);
+      tlsIssue = status.issue;
+      const advice = certAdvice(status, sslCert);
+      if (advice) console.warn(`⚠️  TLS certificate problem: ${advice}`);
+    } catch (err) {
+      console.warn('⚠️  Could not check the TLS certificate chain:', err.message);
+    }
 
     // Also start an HTTP server that redirects to HTTPS (hardened)
     const httpRedirect = express();
@@ -3179,6 +3198,7 @@ if (useSSL) {
     });
   } catch (err) {
     console.error('Failed to load SSL certs, falling back to HTTP:', err.message);
+    if (err.code === 'EACCES') console.error(`   Haven cannot read ${err.path || 'the certificate files'} as this user. Certbot keeps /etc/letsencrypt/live and /etc/letsencrypt/archive readable by root only: copy fullchain.pem and privkey.pem somewhere Haven can read (a certbot deploy hook keeps them fresh), or grant this user read access.`);
     server = createServer(app);
   }
 } else {
@@ -3404,7 +3424,8 @@ initFerry({
           webhook_avatar: avatarUrl || null,
           thread_id: parentId,
           from_discord: true
-        }
+        },
+        followerIds: threadNotify.followerIds(db, parentId)
       });
 
       const count = db.prepare('SELECT COUNT(*) AS n FROM messages WHERE thread_id = ?').get(parentId).n;
@@ -3656,9 +3677,9 @@ server.on('error', (err) => {
         ? `this machine has no network interface with address ${HOST}; check HOST in your .env`
         : process.platform === 'win32'
           ? `Windows refused port ${PORT}. Ports below 1024 need an elevated prompt; otherwise the port is usually inside a reserved range held by Hyper-V/WSL (see: netsh interface ipv4 show excludedportrange protocol=tcp). Pick another PORT in your .env, or free the range with: net stop winnat && net start winnat`
-          : `no permission to bind port ${PORT} (ports below 1024 need elevation)`;
+          : `no permission to bind port ${PORT}. Ports below 1024 need root. Keep Haven on a port above 1024 (the default is 3000) and forward 443 to it on your router, or put a reverse proxy such as Caddy or nginx in front`;
     console.error(`\n❌ Haven could not start: ${why}`);
-    console.error(`   Stop the other process or change PORT in your .env, then start Haven again.`);
+    console.error(err.code === 'EADDRINUSE' ? '   Stop the other process or change PORT in your .env, then start Haven again.' : '   Fix that or change PORT/HOST in your .env, then start Haven again.');
     logCrash('Fatal listen error (exiting)', err);
     process.exit(1);
   }

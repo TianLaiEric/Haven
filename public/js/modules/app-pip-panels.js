@@ -2,6 +2,8 @@
 // and dropping files, message actions, resizing and dragging, and the pop-out
 // DM itself (opening, history, replies, quoting and sending).
 
+import { fitPiPRect, rectToSave } from './pip-geometry.js?v=4.24.6';
+
 const PIP_AVATAR_SHAPES = ['circle', 'rounded', 'squircle', 'hex', 'diamond', 'square'];
 
 export default {
@@ -187,6 +189,8 @@ _bindThreadAndDmPanels() {
           this.socket.emit('unarchive-message', { messageId: msgId });
         } else if (action === 'copy-link') {
           this._copyChannelLink?.(this._activeDMPip, msgId);
+        } else if (action === 'nsfw' || action === 'unnsfw') {
+          this._setMessageNsfw?.(msgId, action === 'nsfw');
         } else if (action === 'thread') {
           // Threads are not available in DMs - swallow the click. The button
           // should already be filtered out at render time, this is defence
@@ -261,6 +265,12 @@ _bindThreadAndDmPanels() {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         this._sendThreadMessage();
+        return;
+      }
+      // Up in an empty box edits your last reply here, as in the channel.
+      if (e.key === 'ArrowUp' && !threadInput.value && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey
+          && localStorage.getItem('haven_up_arrow_edit') !== 'false' && this._editLastThreadMessage()) {
+        e.preventDefault();
         return;
       }
       // Markdown Formatting shortcuts
@@ -389,15 +399,10 @@ _bindThreadAndDmPanels() {
       };
     };
 
-    const savePiPRect = () => {
+    const savePiPRect = (change) => {
       if (!threadPanel.classList.contains('pip')) return;
-      const r = threadPanel.getBoundingClientRect();
-      const rect = {
-        left: Math.round(r.left),
-        top: Math.round(r.top),
-        width: Math.round(r.width),
-        height: Math.round(r.height)
-      };
+      const saved = this._readPiPRect('haven_thread_panel_pip_rect');
+      const rect = rectToSave(saved, threadPanel.getBoundingClientRect(), change);
       localStorage.setItem('haven_thread_panel_pip_rect', JSON.stringify(rect));
     };
 
@@ -418,7 +423,7 @@ _bindThreadAndDmPanels() {
       draggingPiP = false;
       document.removeEventListener('mousemove', onPiPMove);
       document.removeEventListener('mouseup', onPiPUp);
-      savePiPRect();
+      savePiPRect('move');
     };
 
     if (threadHeaderTop) {
@@ -440,17 +445,23 @@ _bindThreadAndDmPanels() {
     if (window.ResizeObserver) {
       const observer = new ResizeObserver(() => {
         if (!threadPanel.classList.contains('pip')) return;
+        // Fitting it to a small window is not the user's choice: keep the saved size.
+        if (!this._pipResizedByUser(threadPanel)) return;
+        this._pipMarkSize(threadPanel);
         clearTimeout(this._threadPiPSaveTimer);
         this._threadPiPSaveTimer = setTimeout(() => {
           const r = threadPanel.getBoundingClientRect();
           const pos = clampPiPRect(r.left, r.top, r.width, r.height);
           threadPanel.style.left = `${pos.left}px`;
           threadPanel.style.top = `${pos.top}px`;
-          savePiPRect();
+          savePiPRect('resize');
         }, 80);
       });
       observer.observe(threadPanel);
     }
+    window.addEventListener('resize', () => {
+      if (threadPanel.classList.contains('pip')) this._applyThreadPiPGeometry(threadPanel);
+    });
   }
 
   // PiP input area height resize: drag the top handle upward to expand the textarea.
@@ -508,6 +519,7 @@ _openDMPiP(code) {
   }
   panel.style.display = 'flex';
   panel.dataset.code = code;
+  this._typingRender?.();
   // Title: partner name, or the group's name for a group DM
   const partnerName = ch.is_group ? this._groupName(ch) : ch.dm_target ? this._getNickname(ch.dm_target.id, ch.dm_target.username) : 'DM';
   const titleEl = document.getElementById('dm-pip-title');
@@ -656,22 +668,48 @@ _closeDMPiP() {
   if (msgs) msgs.innerHTML = '';
 },
 
+_readPiPRect(key) {
+  try { return JSON.parse(localStorage.getItem(key) || 'null'); } catch { return null; /* corrupt or blocked storage: use the default placement */ }
+},
+
+// Fitting a pop-out to the window writes its inline size, and so does the
+// user's own resize (the CSS resize handle). Remembering the last size we
+// know about tells the two apart, so only the user's resize is saved.
+_pipMarkSize(panel) {
+  panel.dataset.pipWidth = panel.style.width;
+  panel.dataset.pipHeight = panel.style.height;
+},
+
+_pipResizedByUser(panel) {
+  return panel.style.width !== panel.dataset.pipWidth || panel.style.height !== panel.dataset.pipHeight;
+},
+
+_placePiP(panel, rect) {
+  panel.style.width = `${rect.width}px`;
+  panel.style.height = `${rect.height}px`;
+  panel.style.left = `${rect.left}px`;
+  panel.style.top = `${rect.top}px`;
+  this._pipMarkSize(panel);
+},
+
+// Both pop-outs refit from the saved rect on every window resize, so a window
+// that shrank and grew again gives back the size and spot the user chose.
 _applyDMPiPGeometry(panel) {
-  let saved = null;
-  try { saved = JSON.parse(localStorage.getItem('haven_dm_pip_rect') || 'null'); } catch { /* corrupt saved position: use the default placement */ }
-  const minW = 320, minH = 280;
-  const maxW = Math.min(720, window.innerWidth - 28);
-  const maxH = Math.max(minH, window.innerHeight - 28);
-  const width = Math.max(minW, Math.min(maxW, (saved && saved.width) || 420));
-  const height = Math.max(minH, Math.min(maxH, (saved && saved.height) || 540));
-  const defaultLeft = Math.max(0, window.innerWidth - width - 20);
-  const defaultTop = Math.max(0, window.innerHeight - height - 80);
-  const left = Math.max(0, Math.min(window.innerWidth - width, (saved && Number.isFinite(saved.left)) ? saved.left : defaultLeft));
-  const top = Math.max(0, Math.min(window.innerHeight - height, (saved && Number.isFinite(saved.top)) ? saved.top : defaultTop));
-  panel.style.width = `${Math.round(width)}px`;
-  panel.style.height = `${Math.round(height)}px`;
-  panel.style.left = `${Math.round(left)}px`;
-  panel.style.top = `${Math.round(top)}px`;
+  this._placePiP(panel, fitPiPRect(this._readPiPRect('haven_dm_pip_rect'), {
+    viewW: window.innerWidth, viewH: window.innerHeight,
+    minW: 320, maxW: 720, minH: 280, width: 420, height: 540, gapX: 20, gapY: 80,
+  }));
+},
+
+_applyThreadPiPGeometry(panel) {
+  const footer = parseInt(getComputedStyle(document.body).getPropertyValue('--thread-footer-offset'), 10);
+  const size = this._threadPiPDefaults || { width: 420, height: 460 };
+  this._placePiP(panel, fitPiPRect(this._readPiPRect('haven_thread_panel_pip_rect'), {
+    viewW: window.innerWidth, viewH: window.innerHeight - (Number.isFinite(footer) ? footer : 0),
+    minW: 320, maxW: 760, minH: 240, width: size.width, height: size.height, gapX: 14, gapY: 14,
+  }));
+  panel.style.right = 'auto';
+  panel.style.bottom = 'auto';
 },
 
 _bindDMPiPDrag() {
@@ -679,6 +717,7 @@ _bindDMPiPDrag() {
   this._dmPipDragBound = true;
   const panel = document.getElementById('dm-pip-panel');
   if (!panel) return;
+  window.addEventListener('resize', () => { if (panel.style.display !== 'none') this._applyDMPiPGeometry(panel); });
   const header = panel.querySelector('.dm-pip-header');
   if (!header) return;
   let startX = 0, startY = 0, startLeft = 0, startTop = 0, dragging = false;
@@ -698,23 +737,28 @@ _bindDMPiPDrag() {
     panel.style.left = `${left}px`;
     panel.style.top = `${top}px`;
   });
-  const persist = () => {
-    if (!panel || panel.style.display === 'none') return;
-    try {
-      localStorage.setItem('haven_dm_pip_rect', JSON.stringify({
-        left: parseInt(panel.style.left, 10) || 0,
-        top: parseInt(panel.style.top, 10) || 0,
-        width: panel.offsetWidth,
-        height: panel.offsetHeight
-      }));
-    } catch { /* storage blocked (private mode): nothing is remembered, nothing else breaks */ }
+  const persist = (change) => {
+    if (panel.style.display === 'none') return;
+    const current = {
+      left: parseInt(panel.style.left, 10) || 0,
+      top: parseInt(panel.style.top, 10) || 0,
+      width: panel.offsetWidth,
+      height: panel.offsetHeight
+    };
+    const rect = rectToSave(this._readPiPRect('haven_dm_pip_rect'), current, change);
+    try { localStorage.setItem('haven_dm_pip_rect', JSON.stringify(rect)); } catch { /* storage blocked (private mode): nothing is remembered, nothing else breaks */ }
   };
   window.addEventListener('mouseup', () => {
-    if (dragging) { dragging = false; persist(); }
+    if (dragging) { dragging = false; persist('move'); }
   });
-  // Persist on resize (CSS resize: both)
+  // Save the user's own resize (CSS resize: both). Fitting it to a small
+  // window also resizes it, and that must not replace the saved size.
   if (typeof ResizeObserver !== 'undefined') {
-    const ro = new ResizeObserver(() => persist());
+    const ro = new ResizeObserver(() => {
+      if (!this._pipResizedByUser(panel)) return;
+      this._pipMarkSize(panel);
+      persist('resize');
+    });
     ro.observe(panel);
   }
 },
@@ -732,23 +776,9 @@ _appendDMPiPMessage(msg) {
   // threads are not available in DMs.
   if (msg) msg._isDmRender = true;
   // Use the previous message in the PiP list as the "prev" reference so
-  // grouping into compact messages still works.
-  let prevMsg = null;
-  const lastEl = list.lastElementChild;
-  if (lastEl && lastEl.dataset && lastEl.dataset.userId && lastEl.dataset.msgId) {
-    // Rebuild enough of the previous message for `_createMessageEl`'s grouping
-    // check. It compares username and persona too, so a prev that only carried
-    // user_id + time never matched and every message rendered ungrouped. (the
-    // dataset already stores these from when the element was created.)
-    prevMsg = {
-      user_id: parseInt(lastEl.dataset.userId, 10),
-      username: lastEl.dataset.username || null,
-      persona_id: lastEl.dataset.personaId ? parseInt(lastEl.dataset.personaId, 10) : null,
-      persona_username: lastEl.dataset.personaUsername || null,
-      break_chain: lastEl.dataset.breakChain === '1' ? 1 : 0,
-      created_at: lastEl.dataset.time
-    };
-  }
+  // grouping into compact messages still works, rebuilt the same way the
+  // main pane does it (message-grouping.js).
+  const prevMsg = this._groupInfoFromElement(list.lastElementChild);
   const wasAtBottom = (list.scrollHeight - list.clientHeight - list.scrollTop) < 80;
   const el = this._createMessageEl(msg, prevMsg);
   list.appendChild(el);
@@ -933,6 +963,14 @@ _sendDMPiPMessage() {
     if (replyTo) payload.replyTo = replyTo;
     const quoteOf = this._takePendingQuote('_dmPipPendingQuote', code, typed);
     if (quoteOf) payload.quoteOf = quoteOf;
+    // Text sent with pictures goes out with them, as one message (#5799).
+    if (content && hasPiPImages && !content.startsWith('/')) {
+      const base = { ...payload };
+      delete base.code;
+      delete base.content;
+      await this._flushPiPImageQueue?.(false, { text: content, base, partner });
+      return;
+    }
     if (content) {
       if (partner) {
         try {

@@ -31,10 +31,15 @@ _renderThreadPreview(parentId, thread, opts = {}) {
   }).join('');
 
   const timeAgo = this._relativeTime(thread.lastReplyAt);
+  // Replies you have not seen yet (app-thread-unread.js); forum cards have
+  // their own dot.
+  const fresh = opts.forum ? 0 : (this._threadNewCount?.(parentId, thread) || 0);
+  if (!opts.forum) this._queueThreadsBadge?.();
   return `
-    <button class="thread-preview" data-thread-parent="${parentId}">
+    <button class="thread-preview${fresh ? ' thread-preview-has-new' : ''}" data-thread-parent="${parentId}">
       ${participantAvatars}
       <span class="thread-preview-count">${t(thread.count === 1 ? 'thread_runtime.reply_one' : 'thread_runtime.reply_other', { count: thread.count })}</span>
+      ${fresh ? this._threadChipNewHtml(fresh) : ''}
       <span class="thread-preview-time">${timeAgo}</span>
       <span class="thread-preview-arrow">›</span>
     </button>
@@ -227,6 +232,8 @@ _openThread(parentId) {
   this._activeThreadParent = parentId;
   // Clear any pending thread mentions for this thread/channel
   this._clearThreadMentionsForParent(this.currentChannel, parentId);
+  // Opening it is reading it: the "N new" marker goes (app-thread-unread.js).
+  this._clearThreadUnread?.(parentId);
   // The server records the read position when it serves the thread; drop the
   // forum card's dot right away rather than on the next reload (#5641).
   if (this._forumActive && this._forumMarkTopicRead) this._forumMarkTopicRead(parentId);
@@ -235,6 +242,7 @@ _openThread(parentId) {
   panel.style.display = 'flex';
   panel.dataset.parentId = parentId;
   this._setThreadPiPEnabled(localStorage.getItem('haven_thread_panel_pip') === '1');
+  if (this._channelBlocksPosting?.()) this._applyThreadClosed(false);
 
   // Request thread messages from server
   this.socket.emit('get-thread-messages', { parentId });
@@ -243,8 +251,7 @@ _openThread(parentId) {
   const msgEl = document.querySelector(`[data-msg-id="${parentId}"]`);
   const author = msgEl?.querySelector('.message-author')?.textContent || t('thread_runtime.starter');
   document.getElementById('thread-panel-title').textContent = t('msg_toolbar.thread');
-  const parentPreview = msgEl?.querySelector('.message-content')?.textContent || '';
-  document.getElementById('thread-parent-preview').textContent = parentPreview.length > 120 ? parentPreview.substring(0, 120) + '…' : parentPreview;
+  document.getElementById('thread-parent-preview').textContent = this._threadRootPreview(msgEl?.dataset?.rawContent ?? msgEl?.querySelector('.message-content')?.textContent ?? '');
 
   const avatarImg = msgEl?.querySelector('.message-avatar-img');
   let avatar = null;
@@ -277,32 +284,9 @@ _setThreadPiPEnabled(enabled) {
   localStorage.setItem('haven_thread_panel_pip', isOn ? '1' : '0');
 
   if (isOn) {
-    let saved = null;
-    try { saved = JSON.parse(localStorage.getItem('haven_thread_panel_pip_rect') || 'null'); } catch { /* corrupt saved position: use the default placement */ }
-
-    const minW = 320;
-    const maxW = Math.min(760, window.innerWidth - 28);
-    const minH = 240;
-    const footerOffset = (() => {
-      const raw = getComputedStyle(document.body).getPropertyValue('--thread-footer-offset');
-      const v = parseInt(raw, 10);
-      return Number.isFinite(v) ? v : 0;
-    })();
-    const maxH = Math.max(minH, window.innerHeight - footerOffset - 28);
-
-    const width = Math.max(minW, Math.min(maxW, (saved && saved.width) || panel.offsetWidth || 420));
-    const height = Math.max(minH, Math.min(maxH, (saved && saved.height) || panel.offsetHeight || 460));
-    const defaultLeft = Math.max(0, window.innerWidth - width - 14);
-    const defaultTop = Math.max(0, window.innerHeight - footerOffset - height - 14);
-    const left = Math.max(0, Math.min(window.innerWidth - width, (saved && Number.isFinite(saved.left)) ? saved.left : defaultLeft));
-    const top = Math.max(0, Math.min(window.innerHeight - footerOffset - height, (saved && Number.isFinite(saved.top)) ? saved.top : defaultTop));
-
-    panel.style.width = `${Math.round(width)}px`;
-    panel.style.height = `${Math.round(height)}px`;
-    panel.style.left = `${Math.round(left)}px`;
-    panel.style.top = `${Math.round(top)}px`;
-    panel.style.right = 'auto';
-    panel.style.bottom = 'auto';
+    // With no saved size, the pop-out starts at the docked panel's size.
+    this._threadPiPDefaults = { width: panel.offsetWidth || 420, height: panel.offsetHeight || 460 };
+    this._applyThreadPiPGeometry(panel);
   } else {
     panel.style.height = '';
     panel.style.left = '';
@@ -326,9 +310,10 @@ _applyThreadClosed(closed) {
   const note = document.getElementById('thread-closed-note');
   const text = document.getElementById('thread-closed-text');
   const canReply = !!(this.user?.isAdmin || this._hasPerm?.('delete_message'));
-  panel?.classList.toggle('thread-locked', !!closed && !canReply);
-  if (note) note.style.display = closed ? '' : 'none';
-  if (text) text.textContent = closed ? t(canReply ? 'forum.closed_you_can_reply' : 'forum.closed_no_replies') : '';
+  const readOnly = !!this._channelBlocksPosting?.();
+  panel?.classList.toggle('thread-locked', readOnly || (!!closed && !canReply));
+  if (note) note.style.display = closed || readOnly ? '' : 'none';
+  if (text) text.textContent = readOnly ? t('thread_runtime.read_only_no_replies') : closed ? t(canReply ? 'forum.closed_you_can_reply' : 'forum.closed_no_replies') : '';
 },
 
 _closeThread() {
@@ -353,15 +338,26 @@ _sendThreadMessage() {
   const content = input.value.trim();
   const parentId = this._activeThreadParent;
   if (!parentId) return;
+  if (this._channelBlocksPosting?.()) return this._showToast?.(t('thread_runtime.read_only_no_replies'), 'error');
   const hasPending = !!(this._threadPending && this._threadPending.length);
   // Nothing to send: no text and no held attachments.
   if (!content && !hasPending) return;
   const replyTo = this._threadReplyingTo ? this._threadReplyingTo.id : (this._forumBlogDefaultReply?.() || null);
 
+  // Text and attachments sent together are one reply (#5799), except in a
+  // blog, where each file is a piece of its own.
+  if (content && hasPending && !this._forumBlogOn?.(this.currentChannel)) {
+    this._lastSendDraft = { text: input.value, code: parentId, at: Date.now(), inputId: 'thread-input' };
+    input.value = '';
+    this._flushThreadPending?.(parentId, { text: content, replyTo });
+    this._clearThreadReply();
+    return;
+  }
+
   if (content) {
     // Kept so a reply refused as too long comes back to the box (#5691).
     this._lastSendDraft = { text: input.value, code: parentId, at: Date.now(), inputId: 'thread-input' };
-    this.socket.emit('send-thread-message', { parentId, content, replyTo }, (resp) => {
+    this.socket.emit('send-thread-message', { parentId, content, replyTo, ...this._forumBlogSendExtras?.(parentId, replyTo) }, (resp) => {
       if (resp && resp.error) {
         this._showToast(resp.error, 'error');
         return;
@@ -378,9 +374,11 @@ _sendThreadMessage() {
   }
 },
 
-_appendThreadMessage(msg) {
+_appendThreadMessage(msg, opts = {}) {
   const container = document.getElementById('thread-messages');
   if (!container) return;
+  // Where the reader was before this reply went in (app-thread-scroll.js).
+  const gapBefore = container.scrollHeight - container.scrollTop - container.clientHeight;
   // In a blog-mode forum a reply goes to the post's own section or to the
   // comments under it (#5742); otherwise straight into the thread.
   const target = this._forumBlogTargetFor?.(msg) || container;
@@ -402,7 +400,11 @@ _appendThreadMessage(msg) {
   }
 
   const reactionsHtml = this._renderReactions(msg.id, msg.reactions || []);
-  const replyHtml = msg.replyContext ? this._renderReplyBanner(msg.replyContext) : '';
+  // Some clients send every thread reply as a reply to the thread's own
+  // first message; in the thread that says nothing, so no banner. A blog
+  // keeps it: there it is a comment on the post's first picture (#5753).
+  const toRoot = this._isThreadRootReply(msg);
+  const replyHtml = msg.replyContext && !toRoot ? this._renderReplyBanner(msg.replyContext) : '';
   const canDelete = msg.user_id === this.user.id || this.user.isAdmin || this._canModerate();
   const canEdit = msg.user_id === this.user.id;
   const iconPair = (emoji, monoSvg) => `<span class="tb-icon tb-icon-emoji" aria-hidden="true">${emoji}</span><span class="tb-icon tb-icon-mono" aria-hidden="true">${monoSvg}</span>`;
@@ -414,6 +416,13 @@ _appendThreadMessage(msg) {
   const iMore = iconPair('⋯', '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="1.6" fill="currentColor" stroke="none"></circle><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"></circle><circle cx="18" cy="12" r="1.6" fill="currentColor" stroke="none"></circle></svg>');
   const threadCoreToolbarBtns = `<button data-thread-action="react" title="${t('msg_toolbar.react')}" aria-label="${t('msg_toolbar.react')}">${iReact}</button><button data-thread-action="reply" title="${t('msg_toolbar.reply')}">${iReply}</button><button data-thread-action="quote" title="${t('msg_toolbar.quote')}">${iQuote}</button>`;
   let threadOverflowToolbarBtns = '';
+  // NSFW mark (app-message-nsfw.js): your own reply, or anyone's you could delete.
+  if (canEdit || this.user.isAdmin || this._canModerate() || this._hasPerm?.('delete_message')) {
+    const iNsfw = iconPair('🔞', '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12s3.5-6 9-6 9 6 9 6-3.5 6-9 6-9-6-9-6z" stroke-width="1.8" stroke-linejoin="round"></path><circle cx="12" cy="12" r="2.5" stroke-width="1.8"></circle><path d="M4 4l16 16" stroke-width="1.8" stroke-linecap="round"></path></svg>');
+    threadOverflowToolbarBtns += msg.nsfw
+      ? `<button data-thread-action="unnsfw" title="${t('msg_toolbar.unmark_nsfw')}">${iNsfw}</button>`
+      : `<button data-thread-action="nsfw" title="${t('msg_toolbar.mark_nsfw')}">${iNsfw}</button>`;
+  }
   if (canEdit) threadOverflowToolbarBtns += `<button data-thread-action="edit" title="${t('msg_toolbar.edit')}">${iEdit}</button>`;
   if (canDelete) threadOverflowToolbarBtns += `<button data-thread-action="delete" title="${t('msg_toolbar.delete')}">${iDelete}</button>`;
   const threadOverflowHtml = threadOverflowToolbarBtns
@@ -431,12 +440,10 @@ _appendThreadMessage(msg) {
   // name header of their own (#5742).
   if (this._forumBlogIsPart?.(msg)) {
     threadCompact = true;
-  } else if (prevEl && prevEl.classList?.contains('thread-message') && !msg.reply_to) {
-    const samePerson = parseInt(prevEl.dataset.userId, 10) === msg.user_id
-      && (prevEl.dataset.personaId || '') === (msg.persona_id ? String(msg.persona_id) : '');
-    const prevTime = prevEl.dataset.time ? new Date(prevEl.dataset.time).getTime() : 0;
-    const within = prevTime && (new Date(msg.created_at).getTime() - prevTime) < 5 * 60 * 1000;
-    threadCompact = samePerson && within;
+  } else if (prevEl && prevEl.classList?.contains('thread-message') && (!msg.reply_to || toRoot)) {
+    // The same rule as the channel (message-grouping.js). A reply to the
+    // thread's own first message counts as a plain message here.
+    threadCompact = this._groupsWithPrevious(this._groupInfoFromElement(prevEl), toRoot ? { ...msg, reply_to: null } : msg);
   }
 
   // A reply's picture shows its tags like a chat message does (#5682).
@@ -455,6 +462,9 @@ _appendThreadMessage(msg) {
   if (msg.avatar) el.dataset.avatar = msg.avatar;
   if (msg.avatar_shape) el.dataset.avatarShape = msg.avatar_shape;
   if (msg.persona_id) el.dataset.personaId = String(msg.persona_id);
+  this._stampGroupSource(el, msg);
+  if (msg.silent) el.dataset.silent = '1';
+  const silentHtml = this._silentTagHtml?.(msg) || '';
   if (threadCompact) {
     const shortTime = this._fmtTime(msg.created_at);
     el.innerHTML = `
@@ -465,7 +475,7 @@ _appendThreadMessage(msg) {
             <div class="msg-toolbar-group">${threadCoreToolbarBtns}</div>
             ${threadOverflowHtml}
           </div>
-          <div class="thread-msg-content">${this._formatContent(msg.content)}</div>
+          <div class="thread-msg-content">${this._formatContent(msg.content)}${silentHtml}</div>
           ${reactionsHtml}${threadTagsHtml}
         </div>
       </div>
@@ -485,12 +495,13 @@ _appendThreadMessage(msg) {
             </div>
           </div>
           ${replyHtml}
-          <div class="thread-msg-content">${this._formatContent(msg.content)}</div>
+          <div class="thread-msg-content">${this._formatContent(msg.content)}${silentHtml}</div>
           ${reactionsHtml}${threadTagsHtml}
         </div>
       </div>
     `;
   }
+  if (msg.nsfw) this._applyMessageNsfw?.(el, true);
   target.appendChild(el);
   if (target !== container) this._forumBlogRecount?.();
   // Link cards in threads, the same as in the channel (#5620).
@@ -499,7 +510,39 @@ _appendThreadMessage(msg) {
   try { this._decryptE2EFiles?.(el); } catch (err) { console.warn('[Thread] _decryptE2EFiles failed', err); }
   try { if (this._isDmContainer(el)) this._enforceDmLinkPolicy?.(el); } catch (err) { console.warn('[Thread] _enforceDmLinkPolicy failed', err); }
   try { this._setupVideos?.(el); } catch (err) { console.warn('[Thread] _setupVideos failed', err); }
-  container.scrollTop = container.scrollHeight;
+  // Loading the thread lands at its end; a reply arriving later moves the
+  // view only for a reader who is already there.
+  if (opts.live && this._threadAfterLiveReply) this._threadAfterLiveReply(container, gapBefore, msg);
+  else container.scrollTop = container.scrollHeight;
+},
+
+// Up in the empty reply box: edit your newest reply in the open thread,
+// docked or popped out. Returns whether there was one to edit.
+_editLastThreadMessage() {
+  const box = document.getElementById('thread-messages');
+  if (!box || !this.user) return false;
+  const mine = [...box.querySelectorAll('.thread-message')]
+    .filter(el => parseInt(el.dataset.userId, 10) === this.user.id && !el.classList.contains('editing'));
+  const el = mine[mine.length - 1];
+  if (!el) return false;
+  this._startEditMessage(el, parseInt(el.dataset.msgId, 10));
+  el.scrollIntoView({ block: 'nearest' });
+  return true;
+},
+
+// The line under a thread's header, and its row in the Threads list:
+// pictures and files by name, as reply lines show them, never the address
+// they are stored under.
+_threadRootPreview(content, max = 120) {
+  const text = this._replyPreviewText ? this._replyPreviewText(content) : String(content || '');
+  return text.length > max ? text.substring(0, max) + '…' : text;
+},
+
+// Whether a thread reply answers the thread's own first message.
+_isThreadRootReply(msg) {
+  if (!msg || msg.reply_to == null || this._forumBlogThread) return false;
+  const root = msg.thread_id != null ? msg.thread_id : this._activeThreadParent;
+  return root != null && Number(msg.reply_to) === Number(root);
 },
 
 // Promote a compact thread reply back to a full row (avatar + author header

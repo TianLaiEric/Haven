@@ -71,11 +71,14 @@ const registerMessageHighlights = require('./messageHighlights');
 const registerModCases = require('./modCases');
 const registerPermExceptions = require('./permExceptions');
 const modCases = require('../modCases');
-const { quietRecipients } = require('../pushMutes');
+const { quietRecipients, pingedRecipients } = require('../pushMutes');
 const registerForumUnread = require('./forumUnread');
 const forumUnread = require('../forumUnread');
 const registerForumVotes = require('./forumVotes');
 const registerForumPictureVotes = require('./forumPictureVotes');
+const registerBadges = require('./badges');
+const registerMoveToThread = require('./moveToThread');
+const registerMessageNsfw = require('./messageNsfw');
 const createLiveAccess = require('./liveAccess');
 const ADMIN_USERNAME = (process.env.ADMIN_USERNAME || 'admin').toLowerCase();
 
@@ -123,7 +126,7 @@ function setupSocketHandlers(io, db, opts = {}) {
 
   // ── Permission helpers (shared across all connections) ───
   const {
-    getChannelRoleChain, getUserEffectiveLevel, getPermissionThresholds,
+    getChannelRoleChain, getUserEffectiveLevel,
     userHasPermission, getUserPermissions, getUserGlobalPermissions, getUserRoles, getUserHighestRole, getUserAllRoles,
     parseRoleGate, roleGateAllows, getUserUploadMb, syncRoleGateMemberships
   } = createPermissions(db);
@@ -1474,19 +1477,28 @@ function setupSocketHandlers(io, db, opts = {}) {
   }
 
   // ── Push notification helper ────────────────────────────
-  function sendPushNotifications(channelId, channelCode, channelName, senderUserId, senderUsername, messageContent) {
+  // pushOpts.replyToUserId: the author of the message this one replies to.
+  // pushOpts.pingText: the real text to look for pings in, when the push
+  // shows a stand-in (a burn or self-destructing message).
+  // pushOpts.silent: a silent message (src/silentMessages.js) pushes nobody,
+  // DMs and mentions included, on web push and FCM alike.
+  function sendPushNotifications(channelId, channelCode, channelName, senderUserId, senderUsername, messageContent, pushOpts = {}) {
+    if (pushOpts && pushOpts.silent) return;
     try {
       const activeUserIds = new Set();
       for (const [, s] of io.sockets.sockets) {
         if (s.user && s.hasFocus !== false) activeUserIds.add(s.user.id);
       }
 
+      // onlyUserIds narrows a push to some members, such as the author of a
+      // message someone just started a thread on.
+      const only = Array.isArray(pushOpts.onlyUserIds) ? new Set(pushOpts.onlyUserIds) : null;
       const subs = db.prepare(`
-        SELECT ps.endpoint, ps.p256dh, ps.auth, ps.user_id
+        SELECT ps.endpoint, ps.p256dh, ps.auth, ps.user_id, ps.scope
         FROM push_subscriptions ps
         JOIN channel_members cm ON cm.user_id = ps.user_id
         WHERE cm.channel_id = ? AND ps.user_id != ?
-      `).all(channelId, senderUserId);
+      `).all(channelId, senderUserId).filter(s => !only || only.has(s.user_id));
 
       // 3.20.2 (#5399 follow-up): pull the per-user mute set for this
       // channel up front so we can skip both web-push AND FCM for anyone
@@ -1515,6 +1527,25 @@ function setupSocketHandlers(io, db, opts = {}) {
         throttledWarn('push personal mute lookup failed', err);
       }
 
+      // A device with Notifications off (Settings > Sounds) is pushed only
+      // DMs, replies to its owner and pings, like its sounds and pop-ups.
+      // Worked out only for the owners of such devices.
+      const pingedAmong = (rows) => {
+        const userIds = [...new Set(rows.filter(r => r.scope === 'mentions').map(r => r.user_id))];
+        if (!userIds.length) return new Set();
+        try {
+          return pingedRecipients(db, {
+            channelId, userIds, replyToUserId: pushOpts.replyToUserId,
+            messageContent: pushOpts.pingText != null ? pushOpts.pingText : messageContent,
+          });
+        } catch (err) {
+          // Push them anyway, as before this setting existed.
+          throttledWarn('push mention lookup failed', err);
+          return new Set(userIds);
+        }
+      };
+      const webPinged = pingedAmong(subs);
+
       // Detect E2E encrypted envelope; don't leak ciphertext in notifications
       let displayContent = messageContent;
       try {
@@ -1533,6 +1564,7 @@ function setupSocketHandlers(io, db, opts = {}) {
         if (activeUserIds.has(sub.user_id)) continue;
         if (mutedUserIds.has(sub.user_id)) continue;
         if (quietFor.has(sub.user_id)) continue;
+        if (sub.scope === 'mentions' && !webPinged.has(sub.user_id)) continue;
         queuePush(sub, channelCode, payload);
       }
 
@@ -1544,6 +1576,7 @@ function setupSocketHandlers(io, db, opts = {}) {
           SELECT DISTINCT cm.user_id FROM channel_members cm
           WHERE cm.channel_id = ? AND cm.user_id != ?
         `).all(channelId, senderUserId)
+          .filter(m => !only || only.has(m.user_id))
           .filter(m => !activeUserIds.has(m.user_id))
           .filter(m => !mutedUserIds.has(m.user_id))
           .filter(m => !quietFor.has(m.user_id))
@@ -1551,8 +1584,9 @@ function setupSocketHandlers(io, db, opts = {}) {
 
         if (inactiveMembers.length) {
           const placeholders = inactiveMembers.map(() => '?').join(',');
-          const fcmRows = db.prepare(`SELECT token FROM fcm_tokens WHERE user_id IN (${placeholders})`).all(...inactiveMembers);
-          const tokens = fcmRows.map(r => r.token);
+          const fcmRows = db.prepare(`SELECT token, user_id, scope FROM fcm_tokens WHERE user_id IN (${placeholders})`).all(...inactiveMembers);
+          const fcmPinged = pingedAmong(fcmRows);
+          const tokens = fcmRows.filter(r => r.scope !== 'mentions' || fcmPinged.has(r.user_id)).map(r => r.token);
 
           if (tokens.length) {
             sendFcm(tokens, title, body, { channelCode, tag: `haven-${channelCode}` })
@@ -1729,6 +1763,21 @@ function setupSocketHandlers(io, db, opts = {}) {
   }
 
   /**
+   * Only the sender's own uploads go to Discord (ferry.keepOwnUploads). The
+   * rest are taken out of what is sent, and the sender hears about it once
+   * per message rather than once per pairing it goes to.
+   */
+  function ownUploadsOnly(body, sender, notify) {
+    const own = ferry.keepOwnUploads(body, sender);
+    if (own.refused) {
+      notify(own.refused === 1
+        ? 'Only your own uploads go to Discord, so 1 file stayed in Haven'
+        : `Only your own uploads go to Discord, so ${own.refused} files stayed in Haven`);
+    }
+    return own.content;
+  }
+
+  /**
    * Relays one just-sent Haven message onward. Fire and forget: a Discord
    * outage must never fail or delay the Haven send that already succeeded,
    * so failures land on the pairing's health row and in a toast to the
@@ -1757,8 +1806,11 @@ function setupSocketHandlers(io, db, opts = {}) {
       username: usePersona ? personaUsername : user.displayName,
       avatar: usePersona ? personaAvatar : (user.avatar || null),
     };
+    const sender = { id: user.id, isAdmin: !!user.isAdmin };
 
     if (target && target.dm) {
+      body = ownUploadsOnly(body, sender, notify);
+      if (!body.trim()) return;
       // The recipient id comes from the client, so being offered in the
       // autocomplete is not proof of anything. Confirm the person is actually
       // in a guild this channel is paired with before sending.
@@ -1769,7 +1821,7 @@ function setupSocketHandlers(io, db, opts = {}) {
             notify('That Discord user is not in a server this channel is linked to');
             return null;
           }
-          return ferry.sendDiscordDm(target.discordUserId, { fromName: identity.username, content: body })
+          return ferry.sendDiscordDm(target.discordUserId, { fromName: identity.username, content: body, sender })
             .then(() => notify('Sent to Discord'));
         })
         .catch(err => notify(err.message));
@@ -1783,14 +1835,15 @@ function setupSocketHandlers(io, db, opts = {}) {
       destinations.push(target.link);
     }
     if (!destinations.length) return;
+    body = ownUploadsOnly(body, sender, notify);
     if (!body.trim()) return;
 
     for (const link of destinations) {
       // A topic in a Haven forum becomes a new post in a Discord forum. The
       // send functions refuse a pairing of mismatched kinds and say so on it.
       const send = topic
-        ? ferry.sendTopicToDiscord(link, { ...identity, content: body, title: topic.title, tags: topic.tags, topicId: topic.id })
-        : ferry.sendToDiscord(link, { ...identity, content: body });
+        ? ferry.sendTopicToDiscord(link, { ...identity, content: body, sender, title: topic.title, tags: topic.tags, topicId: topic.id })
+        : ferry.sendToDiscord(link, { ...identity, content: body, sender });
       Promise.resolve(send).catch(err => notify(`Discord relay failed: ${err.message}`));
     }
   }
@@ -1810,11 +1863,14 @@ function setupSocketHandlers(io, db, opts = {}) {
     if (!ch || !ch.is_forum) return;
     // Silent, like an untargeted message in a mirrored channel.
     if (!user.isAdmin && !userHasPermission(user.id, 'use_ferry', channelId)) return;
+    const sender = { id: user.id, isAdmin: !!user.isAdmin };
+    body = ownUploadsOnly(body, sender, notify);
+    if (!body.trim()) return;
 
     // Thread replies have no persona prefix, so the real name always goes.
     const identity = { username: user.displayName, avatar: user.avatar || null };
     for (const link of links) {
-      ferry.sendReplyToDiscord(link, { ...identity, content: body, topicId: parentId })
+      ferry.sendReplyToDiscord(link, { ...identity, content: body, sender, topicId: parentId })
         .catch(err => notify(`Discord relay failed: ${err.message}`));
     }
   }
@@ -2800,7 +2856,7 @@ function setupSocketHandlers(io, db, opts = {}) {
     const ctx = {
       io, db, state,
       // Permissions
-      getChannelRoleChain, getUserEffectiveLevel, getPermissionThresholds,
+      getChannelRoleChain, getUserEffectiveLevel,
       userHasPermission, getUserPermissions, getUserGlobalPermissions, getUserRoles, getUserHighestRole, getUserAllRoles,
       parseRoleGate, roleGateAllows, getUserUploadMb, syncRoleGateMemberships,
       // Broadcast helpers
@@ -2871,6 +2927,9 @@ function setupSocketHandlers(io, db, opts = {}) {
     registerForumUnread(socket, ctx);
     registerForumVotes(socket, ctx);
     registerForumPictureVotes(socket, ctx);
+    registerBadges(socket, ctx);
+    registerMoveToThread(socket, ctx);
+    registerMessageNsfw(socket, ctx);
 
     // ── Disconnect handler ────────────────────────────────
     // Socket.IO hands us why the socket went away, and throwing that away made

@@ -75,6 +75,22 @@ function classifyThemeApi(declared) {
   };
 }
 
+// The colours the theme picker draws a theme's preview card with, read from
+// the file's own palette tokens. Only plain colour literals are passed on,
+// since the client puts them in a style attribute.
+const SWATCH_TOKENS = { bg: '--bg-primary', panel: '--bg-secondary', accent: '--accent', text: '--text-primary' };
+const COLOR_LITERAL = /^(?:#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})|(?:rgba?|hsla?)\([\d\s.,%/+-]{1,60}\))$/i;
+
+function themeSwatch(content) {
+  if (typeof content !== 'string') return null;
+  const swatch = {};
+  for (const [key, token] of Object.entries(SWATCH_TOKENS)) {
+    const value = content.match(new RegExp(`(?<![\\w-])${token}\\s*:\\s*([^;}!]+)`))?.[1].trim();
+    if (value && COLOR_LITERAL.test(value)) swatch[key] = value;
+  }
+  return swatch.bg ? swatch : null;
+}
+
 function parseThemeMetadata(content) {
   const block = metadataBlock(content);
   const declarations = metadataDeclarations(block);
@@ -107,6 +123,7 @@ function parseThemeMetadata(content) {
     // tweak. Settings toggles for those used to keep injecting :root tokens
     // after the picker moved to Matrix.
     palette: typeof content === 'string' && /--bg-primary\s*:/.test(content),
+    swatch: themeSwatch(content),
   };
 }
 
@@ -188,6 +205,17 @@ function validatedThemeDefault(directory, value, publishedFiles) {
   return isThemeFilename(file) ? '' : value;
 }
 
+// Whether an account may save `value` as its theme. Haven's own themes and
+// published theme files are open to everyone. An unpublished file is only for
+// people who manage the server, apart from the account's current theme and
+// the server's Default Theme, so saving again never takes a look away.
+function themePreferenceAllowed(value, { published = [], current = '', defaultTheme = '', canManage = false } = {}) {
+  if (typeof value !== 'string' || !value.startsWith('file:')) return true;
+  if (canManage === true) return true;
+  if (value === current || value === defaultTheme) return true;
+  return Array.isArray(published) && published.includes(value.slice(5));
+}
+
 module.exports = {
   THEME_API_VERSION,
   BUILTIN_THEMES,
@@ -199,5 +227,7 @@ module.exports = {
   readThemeMetadataFile,
   readThemeMetadataSnapshot,
   themeFileFromRequestPath,
+  themePreferenceAllowed,
+  themeSwatch,
   validatedThemeDefault,
 };

@@ -219,24 +219,27 @@ function rateLimitError(waitMs) {
   return err;
 }
 
+function requestBody(payload, files = []) {
+  if (!files.length) return { body: payload === undefined ? undefined : JSON.stringify(payload), headers: { 'Content-Type': 'application/json' } };
+  const form = new FormData();
+  form.append('payload_json', JSON.stringify({ ...payload, attachments: files.map((f, i) => ({ id: i, filename: f.name })) }));
+  files.forEach((f, i) => form.append(`files[${i}]`, new Blob([fs.readFileSync(f.path)]), f.name));
+  return { body: form, headers: {} };
+}
 /**
  * One REST call with bot auth. Waits out short 429s using Discord's own
  * retry_after, retries once on a 5xx. Everything else surfaces to the caller
  * so the admin UI can show the real reason a pairing is broken.
  */
-async function discordRequest(method, path, body, attempt = 0) {
+async function discordRequest(method, path, body, { files = [] } = {}, attempt = 0) {
   const { token } = getConfig();
   if (!token) throw new Error('No Discord bot token configured');
-
+  const req = requestBody(body, files);
   const res = await fetch(`${API}${path}`, {
     method,
-    headers: {
-      'Authorization': `Bot ${token}`,
-      'Content-Type': 'application/json',
-      'User-Agent': USER_AGENT,
-    },
-    body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(15000),
+    headers: { 'Authorization': `Bot ${token}`, 'User-Agent': USER_AGENT, ...req.headers },
+    body: req.body,
+    signal: AbortSignal.timeout(files.length ? 60000 : 15000),
   });
 
   if (res.status === 429) {
@@ -244,13 +247,13 @@ async function discordRequest(method, path, body, attempt = 0) {
     console.warn(`[ferry] Discord rate limit on ${method} ${path}: retry after ${Math.ceil(wait / 1000)}s`);
     if (attempt < RATE_LIMIT_ATTEMPTS - 1 && wait <= RATE_LIMIT_MAX_WAIT_MS) {
       await sleep(wait);
-      return discordRequest(method, path, body, attempt + 1);
+      return discordRequest(method, path, body, { files }, attempt + 1);
     }
     throw rateLimitError(wait);
   }
   if (res.status >= 500 && attempt < 1) {
     await sleep(1500);
-    return discordRequest(method, path, body, attempt + 1);
+    return discordRequest(method, path, body, { files }, attempt + 1);
   }
 
   if (res.status === 204) return null;
@@ -277,19 +280,10 @@ async function discordRequest(method, path, body, attempt = 0) {
  */
 async function executeWebhook(webhookId, webhookToken, payload, { threadId = null, files = [] } = {}, attempt = 0) {
   const thread = threadId && SNOWFLAKE.test(String(threadId)) ? `&thread_id=${threadId}` : '';
-  // Files go up with the message as multipart, the way Discord takes uploads.
-  let body = JSON.stringify(payload);
-  const headers = { 'User-Agent': USER_AGENT };
-  if (files.length) {
-    body = new FormData();
-    body.append('payload_json', JSON.stringify({ ...payload, attachments: files.map((f, i) => ({ id: i, filename: f.name })) }));
-    files.forEach((f, i) => body.append(`files[${i}]`, new Blob([fs.readFileSync(f.path)]), f.name));
-  } else {
-    headers['Content-Type'] = 'application/json';
-  }
+  const { body, headers } = requestBody(payload, files);
   const res = await fetch(`${API}/webhooks/${webhookId}/${webhookToken}?wait=true${thread}`, {
     method: 'POST',
-    headers,
+    headers: { 'User-Agent': USER_AGENT, ...headers },
     body,
     signal: AbortSignal.timeout(files.length ? 60000 : 15000),
   });
@@ -1528,20 +1522,71 @@ function attachmentName(name) {
   return clean || 'file';
 }
 
+// How Haven writes a file in a message: "[file:Name](/uploads/<name>|size)",
+// and a picture as "/uploads/<name>" or "spoiler-img:/uploads/<name>".
+const UPLOAD_FILE_RE = /\[file:([^\]]*)\]\(\/uploads\/([^)|\s]+)(?:\|[^)]*)?\)/g;
+const UPLOAD_PIC_RE = /(^|\s)(spoiler-img:)?\/uploads\/([^\s]+)/g;
+const UPLOAD_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * Whether `sender` may carry an upload to Discord. A message names its files
+ * as plain paths, so without this anyone could put another member's upload
+ * (from a channel or a DM they saw) on Discord under their own name. Only
+ * the uploader's own files go, by upload_ownership. A file with no record
+ * there (uploaded before records were kept) cannot be shown to be theirs.
+ *
+ * The admin may send any upload but another member's DM files: they already
+ * choose which channels mirror everything to Discord, uploads included, while
+ * DMs stay private from them as everywhere else in Haven.
+ */
+function mayRelayUpload(stored, sender) {
+  if (!sender || !Number.isInteger(sender.id)) return false;
+  let row;
+  try {
+    row = deps.db.prepare('SELECT user_id, scope FROM upload_ownership WHERE rel_path = ?').get(stored);
+  } catch (err) {
+    // Not knowing whose file it is means it stays in Haven.
+    console.warn('[ferry] upload ownership lookup failed:', err.message);
+    return false;
+  }
+  if (row && row.user_id === sender.id) return true;
+  return !!sender.isAdmin && (!row || row.scope !== 'dm');
+}
+
+/**
+ * The message with every file `sender` may not relay taken out, and how many
+ * that was. A file named oddly enough to never be an upload is left for
+ * takeUploads to report as not found.
+ */
+function keepOwnUploads(content, sender) {
+  let refused = 0;
+  const mine = (stored) => {
+    if (!UPLOAD_NAME_RE.test(stored) || mayRelayUpload(stored, sender)) return true;
+    refused++;
+    return false;
+  };
+  const text = String(content || '')
+    .replace(UPLOAD_FILE_RE, (m, name, stored) => (mine(stored) ? m : ''))
+    .replace(UPLOAD_PIC_RE, (m, pre, spoiler, stored) => (mine(stored) ? m : pre));
+  return { content: refused ? text.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim() : text, refused };
+}
+
 /**
  * The files in a Haven message, taken out of its text so they can be uploaded
  * to Discord with it. Haven writes a picture as "/uploads/<name>" and any other
  * file as "[file:Name](/uploads/<name>|size)". Discord cannot open those paths,
  * so a file it can take is sent along, and one it cannot (too big, past ten)
- * stays as a link when PUBLIC_URL is set, or becomes a short note.
+ * stays as a link when PUBLIC_URL is set, or becomes a short note. Files that
+ * are not the sender's to relay (see mayRelayUpload) are left out altogether.
  */
-function takeUploads(content) {
+function takeUploads(content, sender) {
   const { UPLOADS_DIR } = require('./paths');
+  const own = keepOwnUploads(content, sender);
   const files = [];
   let total = 0;
   // Returns null when the file goes along, or why it cannot.
-  const take = (stored, shownName) => {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(stored)) return '(file not found)';
+  const take = (stored, shownName, spoiler = false) => {
+    if (!UPLOAD_NAME_RE.test(stored)) return '(file not found)';
     const full = path.join(UPLOADS_DIR, stored);
     let size;
     try {
@@ -1553,20 +1598,19 @@ function takeUploads(content) {
       return '(too large to send to Discord)';
     }
     total += size;
-    files.push({ path: full, name: attachmentName(shownName || stored) });
+    files.push({ path: full, name: (spoiler ? 'SPOILER_' : '') + attachmentName(shownName || stored) });
     return null;
   };
   const base = (process.env.PUBLIC_URL || '').trim().replace(/\/+$/, '');
-  let text = String(content || '')
-    .replace(/\[file:([^\]]*)\]\(\/uploads\/([^)|\s]+)(?:\|[^)]*)?\)/g, (m, name, stored) => {
+  let text = own.content
+    .replace(UPLOAD_FILE_RE, (m, name, stored) => {
       const why = take(stored, name);
       if (!why) return '';
       return `📎 ${name || stored} ${base ? `${base}/uploads/${stored}` : why}`;
     })
-    .replace(/(^|\s)\/uploads\/([^\s]+)/g, (m, pre, stored) => {
-      const why = take(stored);
-      if (!why) return pre;
-      return base ? m : `${pre}${why}`;
+    .replace(UPLOAD_PIC_RE, (m, pre, spoiler, stored) => {
+      const why = take(stored, null, !!spoiler);
+      return !why ? pre : spoiler ? `${pre}||${base ? `${base}/uploads/${stored}` : why}||` : base ? m : `${pre}${why}`;
     });
   text = text.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
   return { text, files };
@@ -1703,9 +1747,9 @@ async function ensureLinkWebhook(link) {
 /**
  * Relays one Haven message to one paired Discord channel, as the Haven author.
  */
-async function sendToDiscord(link, { username, avatar, content }) {
+async function sendToDiscord(link, { username, avatar, content, sender }) {
   const guild = guilds.get(String(link.guild_id || ''));
-  const { text, files } = takeUploads(content);
+  const { text, files } = takeUploads(content, sender);
   const body = outboundBody(text, guild);
   if (!body.trim() && !files.length) return;
   if (isForumType(link.discord_channel_type)) { touchLink(link.id, KIND_MISMATCH); return; }
@@ -1807,9 +1851,9 @@ function discordForumIsNsfw(guild, link) {
  * makes the post when the webhook call carries `thread_name`, and answers with
  * the post's first message, whose channel is the new post.
  */
-async function sendTopicToDiscord(link, { username, avatar, content, title, tags, topicId, nsfw = false }) {
+async function sendTopicToDiscord(link, { username, avatar, content, sender, title, tags, topicId, nsfw = false }) {
   const guild = guilds.get(String(link.guild_id || ''));
-  const { text, files } = takeUploads(content);
+  const { text, files } = takeUploads(content, sender);
   const body = outboundBody(text, guild);
   if (!body.trim() && !files.length) return;
   if (!isForumType(link.discord_channel_type)) { touchLink(link.id, KIND_MISMATCH); return; }
@@ -1851,9 +1895,9 @@ async function sendTopicToDiscord(link, { username, avatar, content, title, tags
  * replies in Haven. The lookup runs inside the queue, so a reply sent right
  * after its topic waits for the topic's post to exist.
  */
-async function sendReplyToDiscord(link, { username, avatar, content, topicId }) {
+async function sendReplyToDiscord(link, { username, avatar, content, sender, topicId }) {
   const guild = guilds.get(String(link.guild_id || ''));
-  const { text, files } = takeUploads(content);
+  const { text, files } = takeUploads(content, sender);
   const body = outboundBody(text, guild);
   if (!body.trim() && !files.length) return;
   if (!isForumType(link.discord_channel_type)) return;
@@ -1894,12 +1938,13 @@ async function sendReplyToDiscord(link, { username, avatar, content, topicId }) 
  * footer is not decoration: a Discord user who replies to this DM is replying
  * to the bot, and nothing carries that reply back into Haven.
  */
-async function sendDiscordDm(discordUserId, { fromName, content }) {
+async function sendDiscordDm(discordUserId, { fromName, content, sender }) {
   const cfg = getConfig();
   if (!cfg.allowDms) throw new Error('Discord DMs are turned off for this server');
 
-  const body = absolutizeUploads(String(content || '')).trim();
-  if (!body) throw new Error('Message is empty');
+  const { text, files } = takeUploads(content, sender);
+  const body = absolutizeUploads(text).trim();
+  if (!body && !files.length) throw new Error('Message is empty');
 
   return enqueue(`dm:${discordUserId}`, async () => {
     let channel;
@@ -1919,7 +1964,7 @@ async function sendDiscordDm(discordUserId, { fromName, content }) {
       await discordRequest('POST', `/channels/${channel.id}/messages`, {
         content: prefix + body.slice(0, room) + footer,
         allowed_mentions: mentionPolicy(),
-      });
+      }, { files });
     } catch (err) {
       // 50007 is Discord's "this user does not accept DMs from me".
       if (err.discordCode === 50007) {
@@ -2223,6 +2268,7 @@ module.exports = {
   discordTagIdsFor,
   forumThreadName,
   takeUploads,
+  keepOwnUploads,
   applySettings,
   reconnectFerry,
   stopFerry: stop,

@@ -10,9 +10,9 @@
   <link rel="manifest" href="/manifest.webmanifest">
   <title>Haven</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMDAgMTAwIj48cG9seWdvbiBwb2ludHM9IjUwLDMgOTMsMjggOTMsNzIgNTAsOTcgNyw3MiA3LDI4IiBmaWxsPSJub25lIiBzdHJva2U9IiM2YjRmZGIiIHN0cm9rZS13aWR0aD0iOCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPjx0ZXh0IHg9IjUwIiB5PSI2MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZm9udC1mYW1pbHk9IkFyaWFsLEhlbHZldGljYSxzYW5zLXNlcmlmIiBmb250LXdlaWdodD0iYm9sZCIgZm9udC1zaXplPSIzOCIgZmlsbD0iIzZiNGZkYiIgb3BhY2l0eT0iMC45NSI+SDwvdGV4dD48L3N2Zz4=">
-  <link rel="stylesheet" href="/css/style.css?v=4.24.3">
-  <script src="/js/theme-compat.js?v=4.18.3"></script>
-  <script src="/js/theme-init.js?v=4.22.9"></script>
+  <link rel="stylesheet" href="/css/style.css?v=4.25.16">
+  <script src="/js/theme-compat.js?v=4.24.18"></script>
+  <script src="/js/theme-init.js?v=4.24.18"></script>
 </head>
 <body data-haven-page="app">
 
@@ -152,7 +152,17 @@
               <span class="theme-popup-title" data-i18n="app.theme.title">Theme</span>
               <button id="theme-popup-close" class="icon-btn small" data-i18n-title="app.theme.close" title="Close">&times;</button>
             </div>
-            <div class="theme-selector" id="theme-selector" data-haven-region="theme-picker">
+            <!-- Theme gallery (app-theme-picker.js): search, then sections of
+                 preview cards. Haven's own themes start as the buttons below,
+                 which theme.js wires up and the gallery turns into cards. -->
+            <div class="theme-selector theme-gallery" id="theme-selector" data-haven-region="theme-picker">
+              <div class="tp-search-row">
+                <input type="search" id="theme-search" class="tp-search" autocomplete="off" spellcheck="false" aria-controls="theme-gallery-sections" data-i18n-placeholder="app.theme.picker.search" placeholder="Search themes" data-i18n-aria-label="app.theme.picker.search" aria-label="Search themes">
+              </div>
+              <div class="tp-sections" id="theme-gallery-sections"></div>
+              <p class="tp-empty" id="theme-gallery-empty" hidden data-i18n="app.theme.picker.no_match">No themes match your search.</p>
+              <div class="tp-sr-only" id="theme-gallery-status" role="status" aria-live="polite"></div>
+              <div class="tp-builtin-source" hidden>
               <button class="theme-btn active" data-theme="haven" title="Haven"><span class="theme-icon">⬡</span></button>
               <button class="theme-btn" data-theme="discord" title="Discord"><span class="theme-icon">🎮</span></button>
               <button class="theme-btn" data-theme="matrix" title="Matrix"><span class="theme-icon">Ⅿ</span></button>
@@ -181,6 +191,7 @@
               <button class="theme-btn" data-theme="rgb" title="RGB"><span class="theme-icon">🌈</span></button>
               <button class="theme-btn" data-theme="daylight" title="Daylight (Light)"><span class="theme-icon">☀️</span></button>
               <button class="theme-btn" data-theme="cloudy" title="Cloudy (Light)"><span class="theme-icon">☁️</span></button>
+              </div>
             </div>
             <!-- Effect overlay picker (mashup) -->
             <div class="effect-overlay-section">
@@ -281,6 +292,7 @@
 
       <!-- ─── Main Content ────────────────────────────── -->
       <main class="main" data-haven-region="main">
+        <div id="fx-layers"></div>
         <!-- Server Banner (always behind all content) -->
         <div id="server-banner-display" class="server-banner-display" style="display:none">
           <img id="server-banner-img" class="server-banner-img" src="" data-i18n-alt="media.server_banner_alt" alt="Server banner">
@@ -610,6 +622,15 @@
               <button id="self-destruct-btn" class="btn-poll btn-self-destruct" aria-pressed="false" data-i18n-title="app.input_bar.self_destruct_btn" title="Self-destructing message">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.07-2.14-.22-4.05 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.15.43-2.29 1-3a2.5 2.5 0 0 0 2.5 2.5z"/>
+                </svg>
+              </button>
+              <span class="input-actions-divider" id="silent-divider"></span>
+              <button id="silent-btn" class="btn-poll btn-silent" aria-pressed="false" data-i18n-title="app.input_bar.silent_btn" title="Silent message: send without a sound, pop-up or push for anyone (or start it with @silent)" data-i18n-aria-label="app.input_bar.silent_btn" aria-label="Silent message: send without a sound, pop-up or push for anyone (or start it with @silent)">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M8.7 3A6 6 0 0 1 18 8a21.3 21.3 0 0 0 .6 5"/>
+                  <path d="M17 17H3s3-2 3-9a4.67 4.67 0 0 1 .3-1.7"/>
+                  <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>
+                  <line x1="2" y1="2" x2="22" y2="22"/>
                 </svg>
               </button>
               <span class="input-actions-divider" id="highlight-divider" style="display:none"></span>
@@ -953,6 +974,7 @@
       <button id="dm-pip-reply-close-btn" class="icon-btn small" data-i18n-aria-label="header.cancel_reply" aria-label="Cancel reply">&times;</button>
     </div>
     <div id="dm-pip-image-queue-bar" class="image-queue-bar" style="display:none"></div>
+    <div class="typing-indicator dm-pip-typing" id="dm-pip-typing" aria-live="polite"></div>
     <div class="dm-pip-input-area">
       <div class="pip-input-resizer" aria-hidden="true"></div>
       <button id="dm-pip-upload-btn" class="pip-input-emoji-btn" data-i18n-title="media.upload_file_title" title="Upload File"><span class="tb-icon tb-icon-emoji" aria-hidden="true">📎</span><span class="tb-icon tb-icon-mono" aria-hidden="true"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg></span></button>
@@ -985,6 +1007,12 @@
       <div class="thread-parent-preview" id="thread-parent-preview"></div>
     </div>
     <div class="thread-messages" id="thread-messages"></div>
+    <div class="thread-jump-wrap">
+      <button id="thread-jump-latest" class="jump-to-bottom thread-jump-latest" type="button" data-i18n-title="thread_runtime.jump_latest" title="Jump to the latest reply">
+        <span class="thread-jump-count" id="thread-jump-count"></span>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+    </div>
     <div class="thread-reply-bar" id="thread-reply-bar" style="display:none">
       <span id="thread-reply-preview-text"></span>
       <button id="thread-reply-close-btn" class="icon-btn small" data-i18n-aria-label="thread_runtime.cancel_reply" aria-label="Cancel thread reply">&times;</button>
@@ -1465,7 +1493,6 @@
           <div class="settings-nav-item" data-target="section-embed-size">📺 <span data-i18n="settings.nav.embeds_media">Embeds &amp; Media</span></div>
           <div class="settings-nav-item" data-target="section-banner-display">🏞️ <span data-i18n="settings.nav.banner_display">Banner Display</span></div>
           <div class="settings-nav-item" data-target="section-toggle-style">🎚️ <span data-i18n="settings.nav.toggle_style">Toggle Style</span></div>
-          <div class="settings-nav-item" data-target="section-statusbar">📊 <span data-i18n="settings.nav.status_bar">Status Bar</span></div>
 
           <div class="settings-nav-group-label" data-i18n="settings.nav.group_chat">Chat</div>
           <div class="settings-nav-item" data-target="section-chat-behavior">💬 <span data-i18n="settings.nav.chat_behavior">Chat Behavior</span></div>
@@ -1505,6 +1532,7 @@
           <div class="settings-nav-group-label settings-nav-admin" style="display:none" data-i18n="settings.nav.group_people">People &amp; Access</div>
           <div class="settings-nav-item settings-nav-admin" data-target="section-members" style="display:none">👥 <span data-i18n="settings.nav.members">Members</span></div>
           <div class="settings-nav-item settings-nav-admin" data-target="section-roles" style="display:none">👑 <span data-i18n="settings.nav.roles">Roles</span></div>
+          <div class="settings-nav-item settings-nav-admin" data-target="section-badges" style="display:none">🏅 <span data-i18n="settings.nav.badges">Badges</span></div>
           <div class="settings-nav-item settings-nav-admin" data-target="section-moderation" style="display:none">🛡️ <span data-i18n="settings.nav.moderation">Moderation</span></div>
           <div class="settings-nav-item settings-nav-admin" data-target="section-security" style="display:none">🔒 <span data-i18n="settings.nav.security">Security</span></div>
           <div class="settings-nav-item settings-nav-admin" data-target="section-automod" style="display:none">🛡️ <span data-i18n="settings.nav.automod">Moderation</span></div>
@@ -1834,6 +1862,27 @@
           </div>
         </div>
 
+        <!-- Pictures sent together (#5799): the grid, or each picture whole,
+            one under another. Server default follows the admin's choice. -->
+        <div class="settings-subsection" id="media-layout-subsection">
+          <small class="settings-group-label">🗂️ <span data-i18n="settings.image_display.media_layout.title">Pictures Sent Together</span></small>
+          <div class="density-picker" id="media-layout-picker">
+            <button type="button" class="density-btn active" data-media-layout="" title="Server default: whatever the server is set to">
+              <span class="density-icon">🏠</span>
+              <span class="density-label" data-i18n="settings.image_display.media_layout.default">Server default</span>
+            </button>
+            <button type="button" class="density-btn" data-media-layout="grid" data-i18n-title="settings.image_display.media_layout.grid_hint" title="Grid: fit them into one block, each picture cropped to its tile">
+              <span class="density-icon">🔲</span>
+              <span class="density-label" data-i18n="settings.image_display.media_layout.grid">Grid</span>
+            </button>
+            <button type="button" class="density-btn" data-media-layout="stacked" data-i18n-title="settings.image_display.media_layout.stacked_hint" title="Full size: every picture whole, one under another">
+              <span class="density-icon">🖼️</span>
+              <span class="density-label" data-i18n="settings.image_display.media_layout.stacked">Full size, one under another</span>
+            </button>
+          </div>
+          <small class="settings-hint" data-i18n="settings.image_display.media_layout.hint">How several pictures in one message show for you. The grid crops each picture to fill its tile; full size shows every one whole, at the Image Display Mode size above. Saved on your account, so it follows you to every device.</small>
+        </div>
+
         <!-- Animated profile pictures (viewer side). The pfp owner can already turn
             their own animation off for everyone; this is the other half, so a
             viewer who doesn't want moving avatars can stop seeing them. -->
@@ -1900,6 +1949,11 @@
             <span class="density-label" data-i18n="settings.embed_display.full">Full</span>
           </button>
         </div>
+        <label class="toggle-row" style="margin-top:10px">
+          <span data-i18n="settings.embed_display.pause_offscreen">Pause videos and audio scrolled out of view</span>
+          <input type="checkbox" id="pause-offscreen-media">
+        </label>
+        <small class="settings-hint" style="display:block;margin-bottom:6px" data-i18n="settings.embed_display.pause_offscreen_hint">A video, sound file or YouTube card in chat stops when you scroll past it.</small>
       </div>
 
       <!-- Banner Display (client-side) -->
@@ -1941,16 +1995,6 @@
           </button>
         </div>
         <small class="settings-hint" style="margin-top:4px;display:block" data-i18n="settings.toggle_style.hint">Applies to on/off settings. Lists you tick items in, like permissions and channel pickers, always stay as boxes.</small>
-      </div>
-
-      <!-- Status Bar -->
-      <div class="settings-section" id="section-statusbar" style="border-top: 1px solid var(--border-light); padding-top: 16px; margin-top: 8px;">
-        <h5 class="settings-section-title">📊 <span data-i18n="settings.status_bar_section.title">Status Bar</span></h5>
-        <label class="toggle-row">
-          <span data-i18n="settings.status_bar_section.show">Show Status Bar</span>
-          <input type="checkbox" id="show-status-bar">
-        </label>
-        <small class="settings-hint" style="display:block;margin-bottom:6px" data-i18n="settings.status_bar_section.hint">Show the status bar at the bottom of the screen with server, ping, channel, and online info.</small>
       </div>
 
       <!-- Chat Behavior -->
@@ -2020,7 +2064,7 @@
             <span data-i18n="settings.sounds_section.notifications">Notifications</span>
             <input type="checkbox" id="notif-enabled">
           </label>
-          <small class="settings-hint" style="display:block;margin-bottom:6px" data-i18n="settings.sounds_section.notifications_hint">General message sounds (off by default). @Mentions, replies, and DMs always notify.</small>
+          <small class="settings-hint" style="display:block;margin-bottom:6px" data-i18n="settings.sounds_section.notifications_hint">Sounds, pop-ups and push notifications for every message on this device (off by default). @Mentions, replies, and DMs always notify.</small>
           <label class="select-row">
             <span data-i18n="settings.sounds_section.mute_server">Mute this server</span>
             <select id="notif-server-mute-mode" class="settings-select">
@@ -2262,10 +2306,10 @@
         </label>
         <small class="settings-hint" style="display:block;margin-bottom:6px" data-i18n="settings.nsfw.hide_hint">Channels an admin marked 🔞 leave your sidebar until you turn this off. Handy on a phone in public.</small>
         <label class="toggle-row">
-          <span data-i18n="settings.nsfw.blur">Blur NSFW topics until clicked</span>
+          <span data-i18n="settings.nsfw.blur">Blur NSFW topics and messages until clicked</span>
           <input type="checkbox" id="blur-nsfw-topics" checked>
         </label>
-        <small class="settings-hint" style="display:block;margin-bottom:6px" data-i18n="settings.nsfw.blur_hint">The picture and preview of a topic marked 🔞 sit behind a blur, like a spoiler. Turn this off to see them plainly.</small>
+        <small class="settings-hint" style="display:block;margin-bottom:6px" data-i18n="settings.nsfw.blur_hint">Topics and messages marked 🔞 sit behind a blur, like a spoiler. Turn this off to see them plainly.</small>
       </div>
 
       <!-- Password Change Section -->
@@ -2471,6 +2515,17 @@
               <button class="btn-xs shortcut-clear-btn"  data-action="ptt" data-i18n="settings.desktop_shortcuts_section.clear_btn">Clear</button>
             </div>
           </div>
+          <div class="shortcut-row" id="shortcut-row-ptm">
+            <span class="shortcut-label">
+              <span data-i18n="settings.desktop_shortcuts_section.ptm">Push to mute (hold)</span>
+              <small class="settings-hint shortcut-hint" data-i18n="settings.desktop_shortcuts_section.ptm_hint">Hold to mute your mic. Handy on the same key as a game's push to talk.</small>
+            </span>
+            <span class="shortcut-key" id="shortcut-key-ptm" data-i18n="settings.desktop_shortcuts_section.not_set">Not set</span>
+            <div class="shortcut-btns">
+              <button class="btn-xs shortcut-record-btn" data-action="ptm" data-i18n="settings.desktop_shortcuts_section.change_btn">Change</button>
+              <button class="btn-xs shortcut-clear-btn"  data-action="ptm" data-i18n="settings.desktop_shortcuts_section.clear_btn">Clear</button>
+            </div>
+          </div>
         </div>
         <p class="settings-hint" id="shortcut-status" style="margin-top:8px" data-i18n="settings.desktop_shortcuts_section.binding_hint">Lone modifiers (Alt / Ctrl / Shift) and extra mouse buttons (Mouse4 / Mouse5) can be bound here. Some bindings require a recent Haven Desktop build to register at the OS level.</p>
       </div>
@@ -2529,6 +2584,15 @@
       <div class="settings-section" id="section-debug">
         <h5 class="settings-section-title">🐞 <span data-i18n="settings.debug_section.title">Debug</span></h5>
         <p class="settings-desc" data-i18n="settings.debug_section.desc">Experimental client-side toggles. These don't change anything on the server.</p>
+
+        <!-- The status bar (debug footer) was a section of its own for one switch. -->
+        <div class="desktop-pref-row">
+          <label class="toggle-row">
+            <input type="checkbox" id="show-status-bar">
+            <span class="toggle-label" data-i18n="settings.status_bar_section.show">Show Status Bar</span>
+          </label>
+          <p class="settings-hint" data-i18n="settings.status_bar_section.hint">Show the status bar at the bottom of the screen with server, ping, channel, and online info.</p>
+        </div>
 
         <div class="desktop-pref-row">
           <label class="toggle-row">
@@ -3080,6 +3144,18 @@
           </div>
         </div>
 
+        <!-- Badges (Admin / manage_badges): profile badges, earned, from roles or given by hand (#5632) -->
+        <div class="admin-settings" id="section-badges" style="margin-top:10px; padding-top:10px; border-top:1px solid var(--border);">
+          <h5 class="settings-section-subtitle">🏅 <span data-i18n="badges.admin.title">Badges</span></h5>
+          <small class="settings-hint" data-i18n="badges.admin.hint">Small icons on profile cards that show someone's history here. Earned ones appear on their own, role ones come with a role, and hand-given ones are given from a member's right-click menu. Members can hide their own.</small>
+          <div style="margin-top:8px">
+            <button class="btn-sm btn-accent" id="badge-new-btn">➕ <span data-i18n="badges.admin.new">New badge</span></button>
+          </div>
+          <div id="badge-admin-list" class="badge-admin-list">
+            <p class="muted-text" data-i18n="badges.admin.loading">Loading...</p>
+          </div>
+        </div>
+
         <!-- Moderation -->
         <div class="admin-settings" id="section-moderation" style="margin-top:10px; padding-top:10px; border-top:1px solid var(--border);">
           <h5 class="settings-section-subtitle">🛡️ <span data-i18n="settings.admin.moderation_title">Moderation</span></h5>
@@ -3465,10 +3541,18 @@
           </label>
           <small class="settings-hint" data-i18n="settings.admin.max_attachments_hint">How many files someone can queue on one message by dropping, pasting or picking them (1 to 50, default 10). Each one still has to fit the size limit above.</small>
           <label class="select-row" style="margin-top:8px">
-            <span data-i18n="settings.admin.max_tags_per_attachment">Max Tags per Attachment</span>
-            <input type="number" id="max-tags-per-attachment" min="1" max="10" value="3" class="settings-number-input">
+            <span data-i18n="settings.admin.media_group_layout">Pictures sent together</span>
+            <select id="media-group-layout" class="settings-select">
+              <option value="grid" data-i18n="settings.admin.media_group_layout_grid">Grid</option>
+              <option value="stacked" data-i18n="settings.admin.media_group_layout_stacked">Full size, one under another</option>
+            </select>
           </label>
-          <small class="settings-hint" data-i18n="settings.admin.max_tags_per_attachment_hint">How many upload tags a user can put on one attachment (1 to 10, default 3).</small>
+          <small class="settings-hint" data-i18n="settings.admin.media_group_layout_hint">How several pictures in one message show for everyone. The grid fits them into one block and crops each picture to fill its tile. Full size shows every picture whole, one under another, at the size each member picked under Image Display, which suits artwork. Members can choose differently for themselves under Settings, Image Display.</small>
+          <label class="select-row" style="margin-top:8px">
+            <span data-i18n="settings.admin.max_tags_per_attachment">Max Tags per Attachment</span>
+            <input type="number" id="max-tags-per-attachment" min="1" max="20" value="3" class="settings-number-input">
+          </label>
+          <small class="settings-hint" data-i18n="settings.admin.max_tags_per_attachment_hint">How many upload tags a user can put on one attachment (1 to 20, default 3).</small>
           <label class="select-row" style="margin-top:8px">
             <span data-i18n="settings.admin.max_tag_len">Max Tag Length (characters)</span>
             <input type="number" id="max-tag-len" min="1" max="50" value="20" class="settings-number-input">
@@ -3521,7 +3605,7 @@
         <!-- Tags (Admin / manage_tags): manage the upload-tag vocabulary -->
         <div class="admin-settings" id="section-tags-admin" style="margin-top:10px; padding-top:10px; border-top:1px solid var(--border);">
           <h5 class="settings-section-subtitle">🏷️ <span data-i18n="settings.admin.tags_title">Tags</span></h5>
-          <small class="settings-hint" data-i18n="settings.admin.tags_hint">Manage the upload-tag vocabulary. Renaming or deleting a tag applies to every attachment that uses it and cannot be undone.</small>
+          <small class="settings-hint" data-i18n="settings.admin.tags_hint">Manage the upload-tag vocabulary. Renaming or deleting a tag applies to every attachment that uses it and cannot be undone. A tag can be limited to a role: only members with that role are offered it and can put it on their uploads, while everyone still sees it on pictures that already have it.</small>
           <div class="tag-admin-add">
             <input type="text" id="tag-admin-new" class="settings-text-input" maxlength="50" data-i18n-placeholder="settings.admin.tags_add_placeholder" placeholder="New tag name" autocomplete="off">
             <button class="btn-sm btn-accent" id="tag-admin-add-btn" data-i18n="settings.admin.tags_add_btn">Add tag</button>
@@ -4610,7 +4694,8 @@
         <button class="btn-sm" id="organize-move-down" data-i18n="modals.organize.move_down" data-i18n-title="modals.organize.move_down_title" title="Move selected channel down">⬇ Down</button>
         <div class="organize-spacer"></div>
         <div class="organize-tag-group">
-          <input type="text" id="organize-tag-input" class="organize-tag-input" maxlength="30" data-i18n-placeholder="modals.organize.tag_placeholder" placeholder="Tag name…">
+          <input type="text" id="organize-tag-input" class="organize-tag-input" maxlength="30" list="organize-tag-suggestions" autocomplete="off" data-i18n-placeholder="modals.organize.tag_placeholder" placeholder="Tag name…">
+          <datalist id="organize-tag-suggestions"></datalist>
           <button class="btn-sm organize-tag-btn" id="organize-set-tag" data-i18n-title="modals.organize.tag_set_title" title="Apply tag">🏷️ <span data-i18n="modals.organize.tag_set_btn">Set</span></button>
           <button class="btn-sm organize-tag-btn danger" id="organize-remove-tag" data-i18n="modals.organize.tag_remove_btn" data-i18n-title="modals.organize.tag_remove_title" title="Remove tag">✕</button>
         </div>
@@ -4657,7 +4742,8 @@
         <button class="btn-sm" id="dm-organize-move-down" data-i18n="modals.organize.move_down" data-i18n-title="modals.organize.move_down_title" title="Move down">⬇ Down</button>
         <div class="organize-spacer"></div>
         <div class="organize-tag-group">
-          <input type="text" id="dm-organize-tag-input" class="organize-tag-input" maxlength="30" data-i18n-placeholder="modals.dm_organize.category_placeholder" placeholder="Category…">
+          <input type="text" id="dm-organize-tag-input" class="organize-tag-input" maxlength="30" list="dm-organize-tag-suggestions" autocomplete="off" data-i18n-placeholder="modals.dm_organize.category_placeholder" placeholder="Category…">
+          <datalist id="dm-organize-tag-suggestions"></datalist>
           <button class="btn-sm organize-tag-btn" id="dm-organize-set-tag" data-i18n-title="modals.dm_organize.category_set_title" title="Apply category">🏷️ <span data-i18n="modals.organize.tag_set_btn">Set</span></button>
           <button class="btn-sm organize-tag-btn danger" id="dm-organize-remove-tag" data-i18n="modals.organize.tag_remove_btn" data-i18n-title="modals.dm_organize.category_remove_title" title="Remove category">✕</button>
         </div>
@@ -4982,6 +5068,9 @@
       <p class="modal-desc" id="create-sub-parent-name"></p>
       <label style="display:block;margin:12px 0 6px;font-size:0.85rem;opacity:0.7" data-i18n="modals.create_sub.name_label">Sub-channel name</label>
       <input type="text" id="create-sub-name" class="input" maxlength="50" data-i18n-placeholder="modals.create_sub.name_placeholder" placeholder="sub-channel name..." style="width:100%">
+      <label for="create-sub-tag" style="display:block;margin:12px 0 6px;font-size:0.85rem;opacity:0.7" data-i18n="modals.create_sub.tag_label">Tag (optional)</label>
+      <input type="text" id="create-sub-tag" class="input" maxlength="30" list="create-sub-tag-list" data-i18n-placeholder="modals.organize.tag_placeholder" placeholder="Tag name…" style="width:100%">
+      <datalist id="create-sub-tag-list"></datalist>
       <label class="checkbox-row" style="margin:14px 0 8px;display:flex;align-items:center;gap:8px;cursor:pointer">
         <input type="checkbox" id="create-sub-private">
         <span style="font-size:0.9rem">🔒 <span data-i18n="modals.create_sub.private_label">Private</span> <span style="opacity:0.5;font-size:0.8rem" data-i18n="modals.create_sub.private_hint">(invite-only, hidden from non-members)</span></span>
@@ -5005,7 +5094,7 @@
   </div>
 
   <!-- Stackable effect overlay container -->
-  <div id="fx-layers"></div>
+  <div id="fx-overlay"></div>
 
   <!-- Push Notification Error Modal (center-screen, requires acknowledgement) -->
   <!-- Activities / Games Launcher Modal -->
@@ -5243,19 +5332,20 @@
       </div>
     </div>
   </div>
-  <script src="/js/theme.js?v=4.23.9"></script>
+  <script src="/js/theme.js?v=4.25.12"></script>
+  <script src="/js/theme-gallery.js?v=4.24.18"></script>
   <script src="/js/notifications.js?v=4.23.6"></script>
   <script src="/js/servers.js?v=4.23.9"></script>
   <script src="/js/voice-relay.js?v=4.14.2"></script>
-  <script src="/js/voice.js?v=4.23.6"></script>
+  <script src="/js/voice.js?v=4.24.20"></script>
   <script src="/js/modmode.js?v=4.21.0"></script>
   <script src="/js/e2e-group.js?v=4.21.0"></script>
   <script src="/js/e2e.js?v=4.21.0"></script>
   <!-- Shared with the server (src/automod.js requires the same file) so both
        sides reach identical verdicts on a link. Must load before app.js. -->
   <script src="/js/automod-rules.js?v=4.21.0"></script>
-  <script type="module" src="/js/app.js?v=4.24.3"></script>
-  <script src="/js/plugin-loader.js?v=4.23.9"></script>
+  <script type="module" src="/js/app.js?v=4.25.16"></script>
+  <script src="/js/plugin-loader.js?v=4.24.18"></script>
   <script src="/js/modules/stream-debug.js?v=4.21.0"></script>
   <script src="/js/password-eye.js?v=4.21.0"></script>
 </body>

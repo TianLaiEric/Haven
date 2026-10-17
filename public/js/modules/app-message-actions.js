@@ -190,11 +190,11 @@ _bindMessageActions() {
     if (!msgEl || !msgEl.dataset.msgId) return;
     // These targets have their own click/keyboard behavior and should not
     // unexpectedly start a reply when activated twice.
-    if (e.target.closest('button, a, input, textarea, select, [contenteditable="true"], .msg-toolbar, .msg-dots-btn, .reply-banner, .thread-preview, .reaction-badge, .chat-image, .spoiler')) return;
+    if (e.target.closest('button, a, input, textarea, select, [contenteditable="true"], .msg-toolbar, .msg-dots-btn, .reply-banner, .thread-preview, .reaction-badge, .chat-image, .media-grid-tile, .spoiler')) return;
     // A double-click on a word selects it to copy; that is not a reply.
     if (window.getSelection?.()?.toString().trim()) return;
     const msgId = parseInt(msgEl.dataset.msgId, 10);
-    if (!msgId) return;
+    if (!msgId || this._channelBlocksPosting?.()) return;
     e.preventDefault();
     this._setReply(msgEl, msgId);
   });
@@ -202,17 +202,26 @@ _bindMessageActions() {
   // Messages container: move-selection mode intercept (supports Shift+click range)
   document.getElementById('messages').addEventListener('click', (e) => {
     if (!this._moveSelectionActive) return;
-    // Don't intercept toolbar button clicks
-    if (e.target.closest('.msg-toolbar, .msg-dots-btn')) return;
-    const msgEl = e.target.closest('.message, .message-compact');
+    // Don't intercept toolbar button clicks, or Move here as thread
+    if (e.target.closest('.msg-toolbar, .msg-dots-btn, .move-thread-here-btn')) return;
+    // Forum topic cards can be picked too.
+    const msgEl = e.target.closest('.message, .message-compact, .forum-topic');
     if (msgEl) {
       e.preventDefault();
       e.stopPropagation();
+      // The tap a long press leaves behind (app-move-to-thread.js).
+      if (this._moveThreadSwallowing?.()) return;
+      // In another channel than the selection, a message is picked to put
+      // the selection under.
+      if (this._moveThreadPickingHere?.()) {
+        this._moveSelectedIntoThread(msgEl);
+        return;
+      }
 
       if (e.shiftKey && this._lastMoveSelectedEl) {
         // Shift+click: select all messages between last selected and this one
         const container = document.getElementById('messages');
-        const allMsgs = Array.from(container.querySelectorAll('.message, .message-compact'));
+        const allMsgs = Array.from(container.querySelectorAll('.message, .message-compact, .forum-topic'));
         const lastIdx = allMsgs.indexOf(this._lastMoveSelectedEl);
         const curIdx = allMsgs.indexOf(msgEl);
         if (lastIdx !== -1 && curIdx !== -1) {
@@ -246,6 +255,7 @@ _bindMessageActions() {
 
     const msgId = parseInt(msgEl.dataset.msgId);
     if (!msgId) return;
+    if (['reply', 'quote', 'thread'].includes(action) && this._channelBlocksPosting?.()) return this._showToast?.(t('thread_runtime.read_only_no_replies'), 'info');
 
     if (action === 'react') {
       this._showReactionPicker(msgEl, msgId);
@@ -281,6 +291,8 @@ _bindMessageActions() {
       this.socket.emit('unarchive-message', { messageId: msgId });
     } else if (action === 'copy-link') {
       this._copyChannelLink(this.currentChannel, msgId);
+    } else if (action === 'nsfw' || action === 'unnsfw') {
+      this._setMessageNsfw(msgId, action === 'nsfw');
     }
   });
 
@@ -322,6 +334,8 @@ _bindMessageActions() {
           this._quoteThreadMessage(msgEl);
         } else if (action === 'edit') {
           this._startEditMessage(msgEl, msgId);
+        } else if (action === 'nsfw' || action === 'unnsfw') {
+          this._setMessageNsfw(msgId, action === 'nsfw');
         } else if (action === 'delete') {
           if (await this._showConfirmModal(t('confirm.delete_message'), '', { danger: true, confirmLabel: t('msg_toolbar.delete') })) {
             this.socket.emit('delete-message', { messageId: msgId, attachments: this._getMessageAttachments?.(msgId) });
@@ -336,9 +350,12 @@ _bindMessageActions() {
         if (!replyMsgId) return;
         const target = threadMessages.querySelector(`[data-msg-id="${replyMsgId}"]`);
         if (target) {
+          // The same jump and flash as a reply in the channel.
           this._scrollToMessage(target);
-          target.classList.add('thread-highlight');
-          setTimeout(() => target.classList.remove('thread-highlight'), 1200);
+          target.classList.remove('highlight-flash');
+          void target.offsetWidth;
+          target.classList.add('highlight-flash');
+          setTimeout(() => target.classList.remove('highlight-flash'), 2000);
         }
         return;
       }
@@ -403,68 +420,48 @@ _bindMessageActions() {
   bindOverflowDirection(threadMessages);
   bindOverflowDirection(document.getElementById('dm-pip-messages'));
 
-  // Reaction badge hover: show popout with user list
+  // Reaction badge hover: show popout with user list. The popout sits a few
+  // pixels away from its badge, so hiding waits a moment: the pointer can
+  // cross that gap (or cut a corner) and reach the popout's scroll bar.
   {
     let _popoutTimer = null;
-    const msgs = document.getElementById('messages');
-    const threadMsgs = document.getElementById('thread-messages');
-    msgs.addEventListener('mouseover', (e) => {
+    let _hideTimer = null;
+    const isOpenFor = (badge) => {
+      const pop = document.getElementById('reaction-popout');
+      return !!pop && pop._badge === badge;
+    };
+    const onBadgeOver = (e) => {
       const badge = e.target.closest('.reaction-badge');
       if (!badge) return;
+      clearTimeout(_hideTimer);
+      _hideTimer = null;
       clearTimeout(_popoutTimer);
+      if (isOpenFor(badge)) return;
       _popoutTimer = setTimeout(() => this._showReactionPopout(badge), 350);
-    });
-    if (threadMsgs) {
-      threadMsgs.addEventListener('mouseover', (e) => {
-        const badge = e.target.closest('.reaction-badge');
-        if (!badge) return;
-        clearTimeout(_popoutTimer);
-        _popoutTimer = setTimeout(() => this._showReactionPopout(badge), 350);
-      });
-      threadMsgs.addEventListener('mouseout', (e) => {
-        const badge = e.target.closest('.reaction-badge');
-        if (!badge && !e.target.closest('#reaction-popout')) {
-          clearTimeout(_popoutTimer);
-          setTimeout(() => {
-            if (!document.querySelector('#reaction-popout:hover')) this._hideReactionPopout();
-          }, 200);
-        }
-      });
-    }
-    msgs.addEventListener('mouseout', (e) => {
-      const badge = e.target.closest('.reaction-badge');
-      if (!badge && !e.target.closest('#reaction-popout')) {
-        clearTimeout(_popoutTimer);
-        setTimeout(() => {
-          if (!document.querySelector('#reaction-popout:hover')) this._hideReactionPopout();
-        }, 200);
-      }
-    });
-    document.addEventListener('mouseover', (e) => {
-      if (!e.target.closest('#reaction-popout') && !e.target.closest('.reaction-badge')) {
-        clearTimeout(_popoutTimer);
+    };
+    const scheduleHide = () => {
+      clearTimeout(_popoutTimer);
+      if (_hideTimer || !document.getElementById('reaction-popout')) return;
+      _hideTimer = setTimeout(() => {
+        _hideTimer = null;
         this._hideReactionPopout();
+      }, 300);
+    };
+    for (const id of ['messages', 'thread-messages', 'dm-pip-messages']) {
+      document.getElementById(id)?.addEventListener('mouseover', onBadgeOver);
+    }
+    document.addEventListener('mouseover', (e) => {
+      if (e.target.closest('#reaction-popout')) {
+        clearTimeout(_hideTimer);
+        _hideTimer = null;
+      } else if (!e.target.closest('.reaction-badge')) {
+        scheduleHide();
       }
     });
-    // DM PiP reaction badge popout
-    const dmPipMsgs = document.getElementById('dm-pip-messages');
-    if (dmPipMsgs) {
-      dmPipMsgs.addEventListener('mouseover', (e) => {
-        const badge = e.target.closest('.reaction-badge');
-        if (!badge) return;
-        clearTimeout(_popoutTimer);
-        _popoutTimer = setTimeout(() => this._showReactionPopout(badge), 350);
-      });
-      dmPipMsgs.addEventListener('mouseout', (e) => {
-        const badge = e.target.closest('.reaction-badge');
-        if (!badge && !e.target.closest('#reaction-popout')) {
-          clearTimeout(_popoutTimer);
-          setTimeout(() => {
-            if (!document.querySelector('#reaction-popout:hover')) this._hideReactionPopout();
-          }, 200);
-        }
-      });
-    }
+    // Pointer left the window entirely: no mouseover follows, so hide here.
+    document.addEventListener('mouseout', (e) => {
+      if (!e.relatedTarget) scheduleHide();
+    });
   }
 
   // ── Poll vote click (delegated from messages container) ──

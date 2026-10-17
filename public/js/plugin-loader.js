@@ -304,6 +304,23 @@ window.HavenPluginLoader = (function () {
       && meta.compatibility !== 'unsupported';
   }
 
+  // Members use Haven's own themes and the theme files an admin published.
+  // People who manage the server also get the rest, to try them and publish
+  // them. Until the app knows who is signed in, nobody does. The server makes
+  // the same check before it saves a theme file to an account.
+  function canUseUnpublished() {
+    return window.app?._canPublishThemes?.() === true;
+  }
+  function isOffered(file) {
+    const t = loadedThemes.get(file);
+    return !!t && (t.meta?.published === true || canUseUnpublished());
+  }
+  // Settings lists what the viewer may use, plus an unpublished file they
+  // already have on, so they keep it and can still turn it off.
+  function isListed(file, record) {
+    return isOffered(file) || record.enabled || getActiveFileTheme() === file;
+  }
+
   function registerSuppressedPlugin(meta) {
     if (loadedPlugins.has(meta.file)) return;
     loadedPlugins.set(meta.file, {
@@ -446,6 +463,7 @@ window.HavenPluginLoader = (function () {
   function enableTheme(file) {
     const t = loadedThemes.get(file);
     if (!t || t.enabled || suppressExtensions || !t.compatible) return;
+    if (!isOffered(file)) return;
     // A published theme is one of the picker's choices, not a stackable tweak:
     // turning it on means selecting it, so the two surfaces stay in agreement.
     // The account's saved theme has to follow, the same as a picker click,
@@ -517,15 +535,20 @@ window.HavenPluginLoader = (function () {
         if (connectionTimer) clearTimeout(connectionTimer);
         if (saveTimer) clearTimeout(saveTimer);
         socket.off?.('preference-saved', onSaved);
+        socket.off?.('preference-refused', onRefused);
         if (send) socket.off?.('connect', send);
         resolve(value);
       };
       const onSaved = data => {
         if (data?.key === 'theme' && data.value === theme) finish(true);
       };
+      const onRefused = data => {
+        if (data?.key === 'theme' && data.value === theme) finish(false);
+      };
       send = () => {
         if (connectionTimer) clearTimeout(connectionTimer);
         socket.on?.('preference-saved', onSaved);
+        socket.on?.('preference-refused', onRefused);
         socket.emit('set-preference', { key: 'theme', value: theme });
         saveTimer = setTimeout(() => finish(false), 1200);
       };
@@ -563,6 +586,17 @@ window.HavenPluginLoader = (function () {
     if (syncPreference) void persistThemePreference('haven');
     if (notify) HavenApi.UI.showToast(t('settings.plugins_section.theme_fallback'), 'warning');
     renderPluginUI();
+  }
+
+  // The server would not save a theme file as this account's theme: it is
+  // not published (see set-preference). Put Haven back rather than show a
+  // theme the account cannot keep.
+  function onThemeRefused(value) {
+    if (typeof value !== 'string' || !value.startsWith('file:')) return;
+    const file = value.slice(5);
+    if (getActiveFileTheme() !== file) return;
+    fallbackToHaven(file, false, true);
+    HavenApi.UI.showToast(t('settings.plugins_section.theme_not_published'), 'warning');
   }
 
   async function resetCustomizations() {
@@ -624,6 +658,9 @@ window.HavenPluginLoader = (function () {
   }
 
   function renderPluginUI() {
+    // The theme picker redraws from the same records, so a theme switched on
+    // or off in Settings shows the same way in the picker.
+    document.dispatchEvent(new CustomEvent('haven:themes-changed'));
     const container = document.getElementById('plugin-list');
     const themeContainer = document.getElementById('theme-list');
     if (!container || !themeContainer) return;
@@ -659,12 +696,15 @@ window.HavenPluginLoader = (function () {
       }
     }
 
-    // Themes
+    // Themes. Members only see published files, plus one they already have on.
+    const listedThemes = [...loadedThemes].filter(([file, record]) => isListed(file, record));
     if (loadedThemes.size === 0) {
       themeContainer.innerHTML = '<p class="plugin-empty">No themes found. Drop <code>.theme.css</code> files into the <code>themes/</code> folder.</p>';
+    } else if (listedThemes.length === 0) {
+      themeContainer.innerHTML = `<p class="plugin-empty">${escHtml(t('settings.plugins_section.no_published_themes'))}</p>`;
     } else {
       themeContainer.innerHTML = '';
-      for (const [file, themeRecord] of loadedThemes) {
+      for (const [file, themeRecord] of listedThemes) {
         const card = document.createElement('div');
         card.className = 'plugin-card';
         const compatibilityLabel = themeCompatibilityLabel(themeRecord.meta);
@@ -673,12 +713,17 @@ window.HavenPluginLoader = (function () {
             ? t('settings.plugins_section.suppressed_safe_mode')
             : t('settings.plugins_section.incompatible_theme'))}`
           : '';
-        const toggleDisabled = (!themeRecord.compatible || suppressExtensions) && !themeRecord.enabled;
+        // Admins see which files only they can use; a member sees it on the
+        // one they kept, which they can turn off but not back on.
+        const publishLabel = themeRecord.meta.published
+          ? ''
+          : ` • ${escHtml(t('settings.plugins_section.not_published'))}`;
+        const toggleDisabled = (!themeRecord.compatible || suppressExtensions || !isOffered(file)) && !themeRecord.enabled;
         card.innerHTML = `
           <div class="plugin-card-info">
             <div class="plugin-card-name">${escHtml(themeRecord.meta.name || file)}</div>
             <div class="plugin-card-desc">${escHtml(themeRecord.meta.description || '')}</div>
-            <div class="plugin-card-meta">${escHtml(themeRecord.meta.author || '')}${themeRecord.meta.version ? ' • v' + escHtml(themeRecord.meta.version) : ''} • ${escHtml(compatibilityLabel)}${suppressedLabel}</div>
+            <div class="plugin-card-meta">${escHtml(themeRecord.meta.author || '')}${themeRecord.meta.version ? ' • v' + escHtml(themeRecord.meta.version) : ''} • ${escHtml(compatibilityLabel)}${publishLabel}${suppressedLabel}</div>
           </div>
           <label class="plugin-toggle">
             <input type="checkbox" ${themeRecord.enabled ? 'checked' : ''} ${toggleDisabled ? 'disabled' : ''}>
@@ -746,8 +791,6 @@ window.HavenPluginLoader = (function () {
       // no plugin file is fetched or evaluated in safe/recovery mode.
       for (const p of pluginRes || []) await loadPlugin(p);
 
-      if (authoritativeThemes) injectPublishedThemeButtons(themeRes);
-
       if (!suppressExtensions && authoritativeThemes) {
         const requested = pendingFileTheme || (getActiveFileTheme()
           ? { file: getActiveFileTheme(), persist: false, syncFallback: false }
@@ -783,81 +826,21 @@ window.HavenPluginLoader = (function () {
     }
   }
 
-  /**
-   * Inject published .theme.css files as selectable buttons into #theme-selector.
-   * Organizes standard custom themes into #theme-selector and seasonal themes
-   * into a dedicated #seasonal-theme-selector section.
-   */
-  function injectPublishedThemeButtons(themeRes) {
-    const selector = document.getElementById('theme-selector');
-    if (!selector) return;
-    const published = themeRes.filter(t => t.published && isThemeCompatible(t));
-
-    // Remove any previously injected custom-theme buttons (in case of re-init)
-    selector.querySelectorAll('.theme-btn[data-custom-theme]').forEach(b => b.remove());
-
-    let seasonalSection = document.getElementById('seasonal-themes-section');
-    let seasonalSelector = document.getElementById('seasonal-theme-selector');
-    if (seasonalSelector) {
-      seasonalSelector.querySelectorAll('.theme-btn[data-custom-theme]').forEach(b => b.remove());
+  // A theme picked in the theme picker. A full theme (published, or one
+  // that sets the palette) becomes the selected theme and is saved to the
+  // account, as a Settings toggle does. A theme that only adds CSS on top of
+  // the selected one is switched on or off instead.
+  function selectFileTheme(file) {
+    const t = loadedThemes.get(file);
+    if (!t || suppressExtensions || !t.compatible) return false;
+    if (!isOffered(file) && !t.enabled) return false;
+    if (!isExclusiveMeta({ ...t.meta, file })) {
+      if (t.enabled) disableTheme(file); else enableTheme(file);
+      return true;
     }
-
-    const seasonalThemes = published.filter(t => ThemeCompat?.isSeasonalTheme?.(t)), standardThemes = published.filter(t => !seasonalThemes.includes(t));
-
-    function createThemeBtn(theme, targetContainer) {
-      const btn = document.createElement('button');
-      btn.className = 'theme-btn';
-      btn.dataset.theme = `file:${theme.file}`;
-      btn.dataset.customTheme = '1';
-      btn.title = theme.name || theme.file;
-      if (suppressExtensions) btn.disabled = true;
-      const icon = document.createElement('span');
-      icon.className = 'theme-icon';
-      icon.textContent = theme.icon || '🎨';
-      btn.appendChild(icon);
-
-      btn.addEventListener('click', () => {
-        // Apply the file theme exclusively
-        const applied = applyFileTheme(theme.file);
-        // Notify the socket if available
-        if (applied && window.havenSocket && window.havenSocket.connected) {
-          window.havenSocket.emit('set-preference', { key: 'theme', value: `file:${theme.file}` });
-        }
-      });
-
-      targetContainer.appendChild(btn);
-      return btn;
-    }
-
-    // Inject standard custom themes (e.g. Glassy Neon, Amni-Scient, Braid)
-    for (const theme of standardThemes) {
-      createThemeBtn(theme, selector);
-    }
-
-    // Inject seasonal themes into dedicated seasonal section
-    if (seasonalThemes.length > 0) {
-      if (!seasonalSection) {
-        seasonalSection = document.createElement('div');
-        seasonalSection.id = 'seasonal-themes-section';
-        seasonalSection.className = 'seasonal-themes-section';
-        const titleText = (typeof t === 'function' ? t('app.theme.seasonal') : '') || 'Seasonal';
-        seasonalSection.innerHTML = `
-          <div class="theme-popup-title" style="margin-top: 8px;" data-i18n="app.theme.seasonal">${titleText}</div>
-          <div class="theme-selector" id="seasonal-theme-selector"></div>
-        `;
-        selector.parentNode.insertBefore(seasonalSection, selector.nextSibling);
-        seasonalSelector = seasonalSection.querySelector('#seasonal-theme-selector');
-      }
-      seasonalSection.style.display = '';
-      if (!seasonalSelector) {
-        seasonalSelector = seasonalSection.querySelector('#seasonal-theme-selector') || seasonalSection;
-      }
-      for (const theme of seasonalThemes) {
-        createThemeBtn(theme, seasonalSelector);
-      }
-    } else if (seasonalSection) {
-      seasonalSection.style.display = 'none';
-    }
+    if (t.enabled && getActiveFileTheme() === file) return true;
+    if (applyFileTheme(file)) void persistThemePreference(`file:${file}`);
+    return true;
   }
 
   /**
@@ -985,6 +968,9 @@ window.HavenPluginLoader = (function () {
     disableTheme,
     renderPluginUI,
     applyFileTheme,
+    selectFileTheme,
+    onThemeRefused,
+    suppressed: suppressExtensions,
     reapplyEnabledThemes,
     refresh: () => init(true),
   };

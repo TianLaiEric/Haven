@@ -166,7 +166,7 @@ _renderImageQueue() {
 // server enforces in src/uploadTags.js; falls back to the defaults.
 _maxTagsPerAttachment() {
   const n = parseInt(this.serverSettings?.max_tags_per_attachment, 10);
-  return Number.isFinite(n) ? Math.max(1, Math.min(10, n)) : 3;
+  return Number.isFinite(n) ? Math.max(1, Math.min(20, n)) : 3;
 },
 _maxTagLen() {
   const n = parseInt(this.serverSettings?.max_tag_len, 10);
@@ -217,7 +217,7 @@ _renderTagBar() {
     const now = Date.now();
     if (this.socket && now - (this._uploadTagsProbedAt || 0) > 15000) {
       this._uploadTagsProbedAt = now;
-      this.socket.emit('search-upload-tags', { query: '' }, (res) => {
+      this.socket.emit('search-upload-tags', { query: '', code: this.currentChannel }, (res) => {
         if (!res || res.error || !(res.tags || []).length) return;
         this._uploadTagsExist = true;
         this._renderTagBar();
@@ -336,7 +336,7 @@ _tagPopupSearch(query) {
   const input = document.getElementById('tag-popup-input');
   if (!input || !this.socket) return;
   const q = query;
-  this.socket.emit('search-upload-tags', { query: q }, (res) => {
+  this.socket.emit('search-upload-tags', { query: q, code: this.currentChannel }, (res) => {
     if (input.value !== q) return;                 // user moved on
     if (res && res.error === 'rate_limited') return;
     this._renderTagPopupList(q, (res && res.tags) || []);
@@ -484,7 +484,7 @@ _applyFrequentTag(name) {
   if (!this._activeAttachment || !this.socket) return;
   const norm = this._normalizeTag(name);
   if (!norm) { this._removeFrequentTag(name); this._renderFrequentTags(); return; }
-  this.socket.emit('search-upload-tags', { query: norm.name }, (res) => {
+  this.socket.emit('search-upload-tags', { query: norm.name, code: this.currentChannel }, (res) => {
     const exists = ((res && res.tags) || []).some(tg => String(tg.name).toLocaleLowerCase() === norm.norm);
     if (!exists) {
       this._showToast(t('tags.deleted_removed', { name: norm.name }), 'error');
@@ -527,7 +527,7 @@ _makeSpoilerToggle(file, isPip = false) {
   return btn;
 },
 
-async _flushImageQueue(bundled = false, personaPrefix = '', replyTo = null) {
+async _flushImageQueue(bundled = false, personaPrefix = '', replyTo = null, ferryDiscordUserId = null) {
   if (!this._imageQueue || this._imageQueue.length === 0) return;
   // A DM that can't be encrypted asks first; backing out keeps the queue.
   if (!(await this._dmSendGate(this.currentChannel))) return;
@@ -540,7 +540,7 @@ async _flushImageQueue(bundled = false, personaPrefix = '', replyTo = null) {
   // one carries it, the rest follow without the banner.
   let reply = bundled ? null : replyTo;
   for (const file of files) {
-    await this._uploadImage(file, undefined, bundled, personaPrefix, false, { replyTo: reply });
+    await this._uploadImage(file, undefined, bundled, personaPrefix, false, { replyTo: reply, ferryDiscordUserId });
     reply = null;
     if (this._uploadsCancelled) break;   // × on the progress bar stops the batch
   }
@@ -576,13 +576,13 @@ _clearFileQueue() {
   this._renderImageQueue();
 },
 
-async _flushFileQueue() {
+async _flushFileQueue(prefix = '', ferryDiscordUserId = null) {
   if (!this._fileQueue || this._fileQueue.length === 0) return;
   if (!(await this._dmSendGate(this.currentChannel))) return;
   const files = [...this._fileQueue];
   this._clearFileQueue();
   for (const file of files) {
-    this._uploadGeneralFile(file);
+    this._uploadGeneralFile(file, undefined, { prefix, ferryDiscordUserId });
   }
 },
 
@@ -647,19 +647,23 @@ _renderPiPImageQueue() {
   }
 },
 
-async _flushPiPImageQueue(bundled = false) {
+// The pop-out's pictures go out together as one message (#5799), with the
+// text when `text` is given (the pop-out already asked about encryption and
+// passes `partner`).
+async _flushPiPImageQueue(bundled = false, { text = '', base = {}, partner } = {}) {
   if (!this._pipImageQueue || this._pipImageQueue.length === 0) return;
-  if (!(await this._dmSendGate(this._pipImageQueueTarget))) return;
+  let to = partner;
+  if (to === undefined) {
+    const gate = await this._dmSendGate(this._pipImageQueueTarget);
+    if (!gate) return;
+    to = gate.partner;
+  }
   const files = [...this._pipImageQueue];
   const target = this._pipImageQueueTarget;
   this._pipImageQueue = [];
   this._pipImageQueueTarget = null;
   this._renderPiPImageQueue();
-  this._uploadsCancelled = false;
-  for (const file of files) {
-    await this._uploadImage(file, target, bundled);
-    if (this._uploadsCancelled) break;
-  }
+  await this._sendMediaGroups({ code: target, files, text, base, partner: to, bundled: bundled && !text });
 },
 
 // ── Thread attachment queue (#thread-paste-instant) ──────────────────
@@ -731,14 +735,21 @@ _renderThreadPending() {
   }
 },
 
-// Upload each held attachment and post it as a thread reply. Runs from
-// _sendThreadMessage after the text so the ordering feels natural.
-async _flushThreadPending(parentId) {
+// Upload the held attachments and post them as one thread reply, with the
+// text when `text` is given (#5799). In a blog each file stays a piece of its
+// own (#5763), so there they still go one reply each, after the text.
+async _flushThreadPending(parentId, { text = '', replyTo } = {}) {
   if (!this._threadPending || this._threadPending.length === 0) return;
   if (!parentId) return;
   const files = [...this._threadPending];
   this._threadPending = [];
   this._renderThreadPending();
+  if (!this._forumBlogOn?.(this.currentChannel)) {
+    const to = replyTo !== undefined ? replyTo
+      : (this._threadReplyingTo ? this._threadReplyingTo.id : (this._forumBlogDefaultReply?.() || null));
+    await this._sendMediaGroups({ files, text, thread: { parentId, replyTo: to } });
+    return;
+  }
   this._uploadsCancelled = false;
   for (const file of files) {
     try {
@@ -758,7 +769,7 @@ async _flushThreadPending(parentId) {
       // A picture dropped while replying (or in a picture's open comments,
       // #5765) answers what the text would.
       const replyTo = this._threadReplyingTo ? this._threadReplyingTo.id : (this._forumBlogDefaultReply?.() || null);
-      this.socket.emit('send-thread-message', replyTo ? { parentId, content, replyTo } : { parentId, content });
+      this.socket.emit('send-thread-message', replyTo ? { parentId, content, replyTo, ...this._forumBlogSendExtras?.(parentId, replyTo) } : { parentId, content });
     } catch (err) {
       if (err?.aborted) break;
       this._showToast(err.message || t('media.upload_failed'), 'error');

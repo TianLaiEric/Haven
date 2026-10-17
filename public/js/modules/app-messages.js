@@ -25,6 +25,13 @@ async _sendMessage() {
     return;
   }
 
+  // Silent message (app-silent.js): "@silent" up front, or the muted bell.
+  // The prefix comes off here so an encrypted DM never carries it.
+  const silentPick = this._silentSplit(content, hasImages || hasFiles);
+  const silent = silentPick.silent || !!this._silentArmed;
+  content = silentPick.content;
+  const silentField = silent ? { silent: true } : {};
+
   // Self-destructing message: ask how long it lives before anything goes.
   // Backing out leaves the text, the attachments and the toggle as they were.
   // Commands that never post a message are left alone.
@@ -60,14 +67,16 @@ async _sendMessage() {
     if (picker) picker.style.display = 'none';
     this._uploadsCancelled = false;
     const lines = [];
+    const mediaTags = [];   // each picture keeps its own (#5799)
     for (const file of files) {
       const line = await this._uploadImage(file, code, true, '', false, { returnContent: true });
       if (line) lines.push(line);
+      if (line && file?._tags?.length) mediaTags.push({ url: line.slice(line.indexOf('/uploads/')), tags: file._tags });
       if (this._uploadsCancelled) break;
     }
-    const topicTags = [...new Set(files.flatMap(f => (f && Array.isArray(f._tags)) ? f._tags : []))];
-    this.socket.emit('send-message', { code, content: [content, ...lines].join('\n'), ...(topicTags.length ? { attachmentTags: topicTags } : {}), ...this._destructField(destructAt) });
-    if (topicTags.length) this._recordFrequentTags?.(topicTags);
+    this.socket.emit('send-message', { code, content: [content, ...lines].join('\n'), ...(mediaTags.length ? { mediaTags } : {}), ...this._destructField(destructAt), ...silentField });
+    this._setSilentArmed(false);
+    if (mediaTags.length) this._recordFrequentTags?.(mediaTags.flatMap(m => m.tags));
     this.notifications.play('sent');
     if (hasFiles) this._flushFileQueue?.();
     return;
@@ -210,6 +219,8 @@ async _sendMessage() {
   // resolved Discord user id rather than leaving the server to guess.
   const ferryDm = this._ferryPendingDm?.(content);
   if (ferryDm) payload.ferryDiscordUserId = ferryDm;
+  const ferryPrefix = (hasImages || hasFiles) ? (this._ferryPrefix?.(content) || '') : '';
+  const ferryOnly = !!ferryPrefix && !content.replace(/^::[^\s:]+[: ]\s*/, '').slice(ferryPrefix.length).trim();
   if (this.replyingTo) {
     payload.replyTo = this.replyingTo.id;
   }
@@ -228,7 +239,13 @@ async _sendMessage() {
   if (this._burnArmed) {
     payload.burnSeconds = 30;
   }
-  Object.assign(payload, this._destructField(destructAt));
+  Object.assign(payload, this._destructField(destructAt), silentField);
+  this._setSilentArmed(false);
+
+  // Pictures and files go out together, with the text when they can (#5799).
+  const groupMedia = (hasImages || hasFiles) && this._mediaGroupOn(this.currentChannel);
+  const combine = groupMedia && !ferryOnly && this._mediaGroupTakesText(content, payload);
+  let groupPartner = null;
 
   // Clear UI immediately (before any async E2E work)
   input.value = '';
@@ -242,7 +259,7 @@ async _sendMessage() {
   if (picker) picker.style.display = 'none';
 
   // Send text message if there is one
-  if (content) {
+  if (content && !ferryOnly) {
     // E2E: encrypt DM messages
     const ch = this.channels.find(c => c.code === this.currentChannel);
     const isDm = ch && ch.is_dm && (ch.dm_target || ch.is_group);
@@ -336,7 +353,8 @@ async _sendMessage() {
       }
     }
 
-    if (partner) {
+    // Text going with attachments is encrypted and sent with them below.
+    if (partner && !combine) {
       try {
         const encrypted = await this._e2eEncryptText(partner, content);
         payload.content = encrypted;
@@ -349,8 +367,8 @@ async _sendMessage() {
         return false;
       }
     }
-    this.socket.emit('send-message', payload);
-    this.notifications.play('sent');
+    if (combine) groupPartner = partner;
+    else { this.socket.emit('send-message', payload); this.notifications.play('sent'); }
   }
 
   // Upload queued images. Mark as bundled when text was also sent so
@@ -371,11 +389,13 @@ async _sendMessage() {
         }
       }
     }
+    // Everything queued goes out together, ten to a message (#5799).
+    if (groupMedia) return void this._flushComposerMedia({ payload, combine, partner: groupPartner, textSent: !!content && !ferryOnly, replyTo: imageReplyTo, prefix: personaPrefix + ferryPrefix, ferryDiscordUserId: ferryDm, destructAt, silent });
     // (#5425) These were both inside `if (hasImages)`, so a non-image file
     // queued on its own (no image) never flushed and the attachment was stuck
     // in the queue forever. Flush each queue based on its own contents.
-    if (hasImages) this._flushImageQueue(!!content, personaPrefix, imageReplyTo);
-    if (hasFiles) this._flushFileQueue?.();
+    if (hasImages) this._flushImageQueue(!!content && !ferryOnly, personaPrefix + ferryPrefix, imageReplyTo, ferryDm);
+    if (hasFiles) this._flushFileQueue?.(ferryPrefix, ferryDm);
   }
 },
 
@@ -753,18 +773,7 @@ _appendMessages(messages) {
       prevMsg = messages[i - 1];
     } else {
       // Link to existing last message for grouping
-      const lastEl = container.lastElementChild;
-      if (lastEl && lastEl.dataset && lastEl.dataset.userId && lastEl.dataset.msgId) {
-        prevMsg = {
-          user_id: parseInt(lastEl.dataset.userId),
-          created_at: lastEl.dataset.time,
-          persona_id: lastEl.dataset.personaId ? parseInt(lastEl.dataset.personaId) : null,
-          persona_username: lastEl.dataset.personaUsername || null,
-          username: lastEl.dataset.username || null,
-          break_chain: lastEl.dataset.breakChain ? 1 : 0,
-          highlight: lastEl.dataset.highlighted === '1' || undefined,
-        };
-      }
+      prevMsg = this._groupInfoFromElement(container.lastElementChild);
     }
     fragment.appendChild(this._createMessageEl(msg, prevMsg));
   });
@@ -900,21 +909,13 @@ _appendMessage(message, forceScroll = false) {
     });
   }
 
-  let prevMsg = null;
   // Only use last element for grouping if it's an actual message (not a system message)
-  if (lastMsg && lastMsg.dataset && lastMsg.dataset.userId && lastMsg.dataset.msgId) {
-    prevMsg = {
-      user_id: parseInt(lastMsg.dataset.userId),
-      created_at: lastMsg.dataset.time,
-      persona_id: lastMsg.dataset.personaId ? parseInt(lastMsg.dataset.personaId) : null,
-      persona_username: lastMsg.dataset.personaUsername || null,
-      username: lastMsg.dataset.username || null,
-      break_chain: lastMsg.dataset.breakChain ? 1 : 0,
-      highlight: lastMsg.dataset.highlighted === '1' || undefined,
-    };
-  }
+  const prevMsg = this._groupInfoFromElement(lastMsg);
 
   const forumFeed = this._isForumFeed();
+  // A feed showing its newest message follows the new one, even when no
+  // scroll event coupled it (a jump to a message already on screen).
+  if (!forceScroll && !this._coupledToBottom && this._feedAtEnd?.()) this._coupledToBottom = true;
   const wasAtBottom = forceScroll || this._coupledToBottom;
   const nearTop = container.scrollTop < 40;
   const msgEl = this._createMessageEl(message, forumFeed ? null : prevMsg);
@@ -1013,7 +1014,11 @@ _createMessageEl(msg, prevMsg) {
     return el;
   }
   const isImage = this._isImageUrl(msg.content);
-  const curCh = this.channels && this.channels.find(c => c.code === this.currentChannel);
+  // The channel this message is drawn in. The pop-out DM draws while another
+  // channel is open in the main pane, so it goes by the DM, not by the open
+  // channel: a forum open behind it stopped every DM message from grouping.
+  const viewCode = (msg && msg._isDmRender && this._activeDMPip) || this.currentChannel;
+  const curCh = this.channels && this.channels.find(c => c.code === viewCode);
   const isAnnouncement = curCh && curCh.notification_type === 'announcement';
   // Forum topics never fold into each other: every topic keeps its own header,
   // which also keeps _bumpForumTopic's node move safe. (#144)
@@ -1023,29 +1028,12 @@ _createMessageEl(msg, prevMsg) {
   // `curCh.is_dm`. Either signal suppresses the thread button + preview so
   // there is no entry point left in any DM surface.
   const isDmContext = !!(msg && msg._isDmRender) || !!(curCh && curCh.is_dm);
-  const isCompact = prevMsg && !isForum &&
-    // A preceding welcome/system line never folds the next message into it.
-    (prevMsg.type || 'user') === 'user' &&
-    prevMsg.user_id === msg.user_id &&
-    // Persona / webhook / Discord-imported messages must each break the
-    // grouping chain so a different persona under the same account doesn't
-    // get folded under the previous persona's avatar. (#5349 follow-up,
-    // #5393 defence-in-depth: also compare persona_username and the
-    // displayed username so a missing persona_id field can't sneak two
-    // different personas into a single compact group.)
-    (prevMsg.persona_id || null) === (msg.persona_id || null) &&
-    (prevMsg.persona_username || null) === (msg.persona_username || null) &&
-    (prevMsg.username || null) === (msg.username || null) &&
-    // /break and the persisted break_chain flag (#5393) hard-stop grouping.
-    !msg.break_chain && !prevMsg.break_chain &&
-    // Official messages group by the look the reader picked
-    // (_highlightGroups in app-message-highlights.js).
+  // Same author within five minutes folds under the message before it
+  // (message-grouping.js). Official messages group by the look the reader
+  // picked (_highlightGroups in app-message-highlights.js).
+  const isCompact = !!prevMsg && !isForum &&
     this._highlightGroups(msg, prevMsg) &&
-    (prevMsg.is_webhook ? 1 : 0) === (msg.is_webhook ? 1 : 0) &&
-    (prevMsg.webhook_username || null) === (msg.webhook_username || null) &&
-    (prevMsg.imported_from || null) === (msg.imported_from || null) &&
-    !msg.reply_to &&
-    (new Date(msg.created_at) - new Date(prevMsg.created_at)) < 5 * 60 * 1000;
+    this._groupsWithPrevious(prevMsg, msg);
 
   const reactionsHtml = this._renderReactions(msg.id, msg.reactions || []);
   const tagsHtml = this._renderAttachmentTags(msg.attachmentTags);
@@ -1055,7 +1043,8 @@ _createMessageEl(msg, prevMsg) {
   const threadHtml = isDmContext ? ''
     : (msg.thread ? this._renderThreadPreview(msg.id, msg.thread, { forum: isForum })
       : (isForum ? this._renderThreadPreview(msg.id, { count: 0 }, { forum: true }) : ''));
-  const editedHtml = msg.edited_at ? `<span class="edited-tag" title="${t('app.messages.edited_at', { date: this._fmtDateTime(msg.edited_at) })}">${t('app.messages.edited')}</span>` : '';
+  const editedHtml = (msg.edited_at ? `<span class="edited-tag" title="${t('app.messages.edited_at', { date: this._fmtDateTime(msg.edited_at) })}">${t('app.messages.edited')}</span>` : '')
+    + this._silentTagHtml(msg);
   const pinnedTag = msg.pinned ? `<span class="pinned-tag" title="${t('app.messages.pinned')}">📌</span>` : '';
   const archivedTag = msg.is_archived ? `<span class="archived-tag" title="${t('app.messages.protected')}">🛡️</span>` : '';
   const ephemeralTag = msg.ephemeral ? `<span class="ephemeral-tag" title="${t('app.messages.only_visible_to_you')}">${t('app.messages.only_visible_to_you')}</span>` : '';
@@ -1074,17 +1063,20 @@ _createMessageEl(msg, prevMsg) {
   const iDelete = iconPair('🗑️', '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14" stroke-width="1.8" stroke-linecap="round"></path><path d="M9 7V5h6v2" stroke-width="1.8" stroke-linecap="round"></path><path d="M7 7l1 12h8l1-12" stroke-width="1.8" stroke-linejoin="round"></path></svg>');
   const iLink = iconPair('🔗', '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path><path d="M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg>');
   const iMore = iconPair('⋯', '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="1.6" fill="currentColor" stroke="none"></circle><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"></circle><circle cx="18" cy="12" r="1.6" fill="currentColor" stroke="none"></circle></svg>');
+  const iNsfw = iconPair('🔞', '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12s3.5-6 9-6 9 6 9 6-3.5 6-9 6-9-6-9-6z" stroke-width="1.8" stroke-linejoin="round"></path><circle cx="12" cy="12" r="2.5" stroke-width="1.8"></circle><path d="M4 4l16 16" stroke-width="1.8" stroke-linecap="round"></path></svg>');
   const canShareLink = !isDmContext && this._canShareChannelLink?.(this.currentChannel);
 
   const reactionsAllowed = isDmContext || this._channelAllowsReactions?.(this.currentChannel) !== false;
+  const postBlocked = !isDmContext && !!this._channelBlocksPosting?.(this.currentChannel);
   const toolbarActions = [
     ...(reactionsAllowed ? [{ key: 'react', html: `<button data-action="react" title="${t('msg_toolbar.react')}">${iReact}</button>` }] : []),
-    { key: 'reply', html: `<button data-action="reply" title="${t('msg_toolbar.reply')}">${iReply}</button>` },
-    { key: 'quote', html: `<button data-action="quote" title="${t('msg_toolbar.quote')}">${iQuote}</button>` },
+    // Always drawn, and hidden while posting is blocked, so they come back
+    // when a channel stops being read-only (_applyReactionLock toggles them).
+    { key: 'reply', html: `<button data-action="reply" title="${t('msg_toolbar.reply')}"${postBlocked ? ' hidden' : ''}>${iReply}</button>` }, { key: 'quote', html: `<button data-action="quote" title="${t('msg_toolbar.quote')}"${postBlocked ? ' hidden' : ''}>${iQuote}</button>` },
     // Threads are not available in DMs - omit the button entirely so there is
     // no entry point. Server-side `send-thread-message` and `get-thread-messages`
     // also reject DM channels as a defence in depth.
-    ...(isDmContext ? [] : [{ key: 'thread', html: `<button data-action="thread" title="${t('msg_toolbar.thread')}">${iThread}</button>` }]),
+    ...(isDmContext ? [] : [{ key: 'thread', html: `<button data-action="thread" title="${t('msg_toolbar.thread')}"${postBlocked ? ' hidden' : ''}>${iThread}</button>` }]),
     // Message links contain the DM channel code - never expose them in DM context.
     ...(canShareLink ? [{ key: 'copy-link', html: `<button data-action="copy-link" title="${t('msg_toolbar.copy_link')}">${iLink}</button>` }] : [])
   ];
@@ -1116,6 +1108,11 @@ _createMessageEl(msg, prevMsg) {
         : `<button data-action="archive" title="${t('app.messages.protect_btn')}">${iArchive}</button>`
     });
   }
+  // NSFW mark (app-message-nsfw.js): your own message, or anyone's you could
+  // delete; in a DM only your own.
+  if (isDmContext ? msg.user_id === this.user.id : canDelete) {
+    toolbarActions.push({ key: 'nsfw', html: this._messageNsfwToolbarHtml(!!msg.nsfw, iNsfw) });
+  }
   if (msg.user_id === this.user.id) {
     toolbarActions.push({ key: 'edit', html: `<button data-action="edit" title="${t('msg_toolbar.edit')}">${iEdit}</button>` });
   }
@@ -1123,7 +1120,7 @@ _createMessageEl(msg, prevMsg) {
     toolbarActions.push({ key: 'delete', html: `<button data-action="delete" title="${t('msg_toolbar.delete')}">${iDelete}</button>` });
   }
 
-  const defaultToolbarOrder = ['react', 'reply', 'quote', 'thread', 'copy-link', 'pin', 'archive', 'edit', 'delete'];
+  const defaultToolbarOrder = ['react', 'reply', 'quote', 'thread', 'copy-link', 'pin', 'archive', 'nsfw', 'edit', 'delete'];
   let savedToolbarOrder = [];
   try {
     savedToolbarOrder = JSON.parse(localStorage.getItem('haven-toolbar-order') || '[]');
@@ -1172,6 +1169,8 @@ _createMessageEl(msg, prevMsg) {
     if (msg.persona_id) el.dataset.personaId = String(msg.persona_id);
     if (msg.persona_username) el.dataset.personaUsername = msg.persona_username;
     if (msg.break_chain) el.dataset.breakChain = '1';
+    this._stampGroupSource(el, msg);
+    if (msg.silent) el.dataset.silent = '1';
     if (msg.pinned) el.dataset.pinned = '1';
     if (msg.is_archived) el.dataset.archived = '1';
     if (msg._e2e) el.dataset.e2e = '1';
@@ -1205,6 +1204,7 @@ _createMessageEl(msg, prevMsg) {
     // Only with Coloured text or the look turned off does an official
     // message land here, as part of a run.
     if (msg.highlight) this._applyMessageHighlight(el, msg.highlight);
+    if (msg.nsfw) this._applyMessageNsfw(el, true);
     return el;
   }
 
@@ -1306,6 +1306,8 @@ _createMessageEl(msg, prevMsg) {
   if (msg.persona_id) el.dataset.personaId = String(msg.persona_id);
   if (msg.persona_username) el.dataset.personaUsername = msg.persona_username;
   if (msg.break_chain) el.dataset.breakChain = '1';
+  this._stampGroupSource(el, msg);
+  if (msg.silent) el.dataset.silent = '1';
   if (msg.pinned) el.dataset.pinned = '1';
   if (msg.is_archived) el.dataset.archived = '1';
   if (msg._e2e) el.dataset.e2e = '1';
@@ -1350,6 +1352,7 @@ _createMessageEl(msg, prevMsg) {
     </div>
   `;
   if (msg.highlight) this._applyMessageHighlight(el, msg.highlight);
+  if (msg.nsfw) this._applyMessageNsfw(el, true);
   return el;
 },
 

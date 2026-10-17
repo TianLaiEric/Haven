@@ -12,6 +12,7 @@ const {
   validatedThemeDefault,
 } = require('../themeMetadata');
 const memberDefaults = require('../memberDefaults');
+const { MEDIA_GROUP_LAYOUTS } = require('../mediaGroup');
 const { reachableChannel } = require('./channelAccess');
 const { cleanWebhookName, cleanWebhookAvatarUrl } = require('../webhookFields');
 
@@ -129,11 +130,12 @@ module.exports = function register(socket, ctx) {
       'member_visibility', 'cleanup_enabled', 'cleanup_max_age_days', 'cleanup_max_size_mb', 'cleanup_max_uploads_mb',
       'deleted_retention_days', // how long files from deleted messages and channels are kept before they are removed for good
       'keep_self_destructed_attachments', // off removes a self destructed message's files for good instead of holding them
-      'giphy_api_key', 'klipy_api_key', 'tenor_api_key', 'preferred_gif_search', 'server_name', 'server_title', 'server_icon', 'server_banner', 'permission_thresholds',
+      'giphy_api_key', 'klipy_api_key', 'tenor_api_key', 'preferred_gif_search', 'server_name', 'server_title', 'server_icon', 'server_banner',
       'tunnel_enabled', 'tunnel_provider', 'server_code', 'max_upload_mb', 'max_attachments', 'max_poll_options', 'channel_templates',
       'max_tags_per_attachment', 'max_tag_len', // (#tagging phase 4) upload-tag limits
       'max_sound_kb', 'max_avatar_mb', 'max_emoji_kb', 'max_sticker_kb', 'setup_wizard_complete', 'update_banner_admin_only', 'hide_disabled_channel_badges',
       'category_layout', 'category_short_names', // (#5756) category tabs and short names
+      'media_group_layout', // (#5799) pictures sent together: 'grid' or 'stacked'
       'allow_self_purge', // (#5686) members may delete every message they wrote
       'default_theme', 'published_themes', 'channel_sort_mode', 'channel_cat_order', 'channel_cat_sort',
       'channel_tag_sorts', 'custom_tos', 'welcome_message', 'vanity_code', 'default_locale',
@@ -283,7 +285,7 @@ module.exports = function register(socket, ctx) {
     if (key === 'cleanup_max_uploads_mb') { const n = parseInt(value); if (isNaN(n) || n < 0 || n > 10000000) return; value = String(n); }
     if (key === 'max_upload_mb') { const n = parseInt(value); if (isNaN(n) || n < 1 || n > 102400) return; }
     if (key === 'max_attachments') { const n = parseInt(value); if (isNaN(n) || n < 1 || n > 50) return; } // (#5561)
-    if (key === 'max_tags_per_attachment') { const n = parseInt(value); if (isNaN(n) || n < 1 || n > 10) return; } // (#tagging phase 4)
+    if (key === 'max_tags_per_attachment') { const n = parseInt(value); if (isNaN(n) || n < 1 || n > 20) return; } // (#tagging phase 4)
     if (key === 'max_tag_len') { const n = parseInt(value); if (isNaN(n) || n < 1 || n > 50) return; } // (#tagging phase 4)
     if (key === 'max_poll_options') { const n = parseInt(value); if (isNaN(n) || n < 2 || n > 25) return; }
     if (key === 'max_message_chars') { const n = parseInt(value); if (isNaN(n) || n < 200 || n > 100000) return; }
@@ -314,6 +316,7 @@ module.exports = function register(socket, ctx) {
     if (key === 'allow_self_purge' && !['true', 'false'].includes(value)) return;
     if (key === 'hide_disabled_channel_badges' && !['true', 'false'].includes(value)) return;
     if (key === 'category_layout' && !['list', 'tabs'].includes(value)) return;
+    if (key === 'media_group_layout' && !MEDIA_GROUP_LAYOUTS.includes(value)) return;
     if (key === 'category_short_names') {
       // Lowercase category name to a short name or emoji, both plain text.
       try {
@@ -467,32 +470,6 @@ module.exports = function register(socket, ctx) {
         } catch { return; }
       }
     }
-    if (key === 'permission_thresholds') {
-      try {
-        const obj = JSON.parse(value);
-        if (typeof obj !== 'object' || Array.isArray(obj)) return;
-        for (const [k, v] of Object.entries(obj)) {
-          if (!VALID_ROLE_PERMS.includes(k)) return;
-          if (!Number.isInteger(v) || v < 1 || v > 100) return;
-        }
-        // A threshold hands a permission to everyone at or above a level, the
-        // person setting it included. Anyone but an admin sets them only for
-        // permissions they hold server-wide and that are not admin-only; the
-        // rest keep whatever an admin set.
-        if (!socket.user.isAdmin) {
-          const adminOnly = ['transfer_admin', 'manage_roles', 'manage_server', 'delete_channel', 'view_all_channels'];
-          const mine = new Set(ctx.getUserGlobalPermissions(socket.user.id));
-          const mayTouch = (perm) => !adminOnly.includes(perm) && (mine.has('*') || mine.has(perm));
-          let prev = {};
-          try { prev = JSON.parse(db.prepare("SELECT value FROM server_settings WHERE key = 'permission_thresholds'").get()?.value || '{}') || {}; } catch { prev = {}; }
-          const merged = {};
-          for (const [k, v] of Object.entries(prev)) if (!mayTouch(k)) merged[k] = v;
-          for (const [k, v] of Object.entries(obj)) if (mayTouch(k)) merged[k] = v;
-          value = JSON.stringify(merged);
-        }
-      } catch { return; }
-    }
-
     try {
       const save = () => {
         db.prepare('INSERT OR REPLACE INTO server_settings (key, value) VALUES (?, ?)').run(key, value);

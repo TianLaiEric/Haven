@@ -140,12 +140,18 @@
   .message, .message-compact {
     position: relative;
   }
-  /* Ensure compact messages are tall enough that the ⋯ button (28 px)
-     doesn't overflow into adjacent rows and cause visual overlap. */
+  /* A follow-up line keeps the height of its own text. Making it tall
+     enough for the 28 px button left a blank strip under every one-line
+     follow-up (and none under longer ones), so on phones the messages
+     looked spaced out unevenly. Its button is one line tall instead, so
+     neighbouring buttons still never overlap. */
   .message-compact {
-    min-height: 2rem;
+    min-height: 1.375rem;
     display: flex;
     align-items: flex-start;
+  }
+  .message-compact .msg-dots-btn {
+    height: 1.375rem;
   }
   /* Give message rows right padding so text doesn't flow under the ⋯ button */
   .message .message-row,
@@ -1050,7 +1056,10 @@ html.reduce-motion .forum-unread-dot { animation: none; }
 .thread-closed-note { padding: 0.375rem 0.75rem; font-size: 0.75rem; color: var(--text-muted); border-top: 1px solid var(--border); }
 .thread-locked .thread-input-area,
 .thread-locked #thread-reply-bar,
-.thread-locked #thread-image-queue-bar { display: none !important; }
+.thread-locked #thread-image-queue-bar,
+.thread-locked [data-thread-action="reply"],
+.thread-locked [data-thread-action="quote"] { display: none !important; }
+.msg-toolbar button[hidden] { display: none !important; }
 /* Comments on pictures only (#5765): no general Comments section, and no
    reply box until a picture's comments are open (the author keeps theirs). */
 .thread-blog-pics-only #blog-comments-head,
@@ -1161,10 +1170,20 @@ html.reduce-motion .forum-unread-dot { animation: none; }
 .forum-post-modal { max-width: 34rem; width: 94%; }
 .forum-field { display: flex; flex-direction: column; gap: 0.3rem; margin-bottom: 0.75rem; font-size: 0.85rem; color: var(--text-secondary); }
 .forum-field input, .forum-field textarea { background: var(--bg-input); color: var(--text-primary); border: 1px solid var(--border); border-radius: var(--radius); padding: 0.5rem 0.6rem; font: inherit; }
+/* Taller only: dragging the corner sideways pushed the body out of the window. */
+.forum-field textarea { resize: vertical; max-width: 100%; max-height: 60vh; }
 .forum-tag-picker { display: flex; flex-wrap: wrap; gap: 0.35rem; }
 /* Pictures and files in a post's body (#5689, #5690) */
 .forum-attach-row { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; margin: -0.35rem 0 0.75rem; }
 .forum-attach-row .settings-hint { margin: 0; }
+/* The pictures in a new post's body, the thumbnail first and marked. */
+.forum-thumb-preview { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; margin: -0.35rem 0 0.75rem; }
+.forum-thumb-preview .settings-hint { margin: 0; }
+.forum-thumb-item { position: relative; width: 4rem; height: 4rem; border-radius: var(--radius); overflow: hidden; border: 1px solid var(--border); }
+.forum-thumb-item img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.forum-thumb-first { width: 6rem; height: 4.5rem; border-color: var(--accent); }
+.forum-thumb-badge { position: absolute; left: 0; right: 0; bottom: 0; padding: 0.1rem 0.25rem; font-size: 0.65rem; text-align: center; color: #fff; background: rgba(0, 0, 0, 0.6); }
+.forum-thumb-more { font-size: 0.8rem; color: var(--text-muted); }
 .forum-post-modal.drag-over { outline: 2px dashed var(--accent); outline-offset: -4px; }
 .forum-post-modal .modal-footer { display: flex; justify-content: flex-end; align-items: center; gap: 0.4rem; }
 .forum-post-modal .modal-footer .forum-post-delete { margin-right: auto; font-size: 0.85rem; }

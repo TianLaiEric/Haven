@@ -262,18 +262,16 @@ _renderThreadList(filter = '') {
     const label = replies === 1
       ? t('thread_list.reply_one')
       : t('thread_list.reply_other', { count: replies });
-    // Strip attachment markdown so a thread started with a file reads as its
-    // filename rather than a wall of markup.
-    const preview = String(th.content || '')
-      .replace(/\[file:([^\]]+)\]\([^)]*\)/g, '$1')
-      .replace(/!\[[^\]]*\]\(([^)\s]+)\)/g, '$1')
-      .trim();
+    // Pictures and files read by name, as on reply lines, rather than as
+    // markup or the address they are stored under.
+    const preview = this._threadRootPreview(th.content, 300);
     return `
       <button class="thread-list-row" data-parent-id="${th.id}">
         <span class="thread-list-row-top">
           <span class="thread-list-author">${this._escapeHtml(th.username || '')}</span>
           <span class="thread-list-replies">${this._escapeHtml(label)}</span>
           <span class="thread-list-when">${this._escapeHtml(this._formatTime?.(th.last_reply_at) || '')}</span>
+          ${this._threadListNewHtml?.(th) || ''}
         </span>
         <span class="thread-list-preview">${this._escapeHtml(preview)}</span>
       </button>`;
@@ -680,7 +678,7 @@ _mediaTagFilterSearch(query) {
   const input = document.getElementById('mtf-input');
   if (!input || !this.socket) return;
   const q = query;
-  this.socket.emit('search-upload-tags', { query: q }, (res) => {
+  this.socket.emit('search-upload-tags', { query: q, code: this.currentChannel }, (res) => {
     if (input.value !== q) return;
     if (res && res.error === 'rate_limited') return;
     this._mediaTagFilterRenderList((res && res.tags) || []);
@@ -823,7 +821,7 @@ _mediaTagManageSearch(query) {
   const input = document.getElementById('mtm-input');
   if (!input || !this.socket || !this._mediaTagManage) return;
   const q = query;
-  this.socket.emit('search-upload-tags', { query: q }, (res) => {
+  this.socket.emit('search-upload-tags', { query: q, code: this.currentChannel }, (res) => {
     if (!this._mediaTagManage || input.value !== q) return;
     if (res && res.error === 'rate_limited') return;
     this._mediaTagManageRenderList(q, (res && res.tags) || []);
@@ -891,23 +889,27 @@ _mediaTagManageApply() {
   if (!st || !this.currentChannel || !this.socket) return;
   const ids = this._mediaSelectedMessageIds();
   if (!ids.length) { this._closeMediaTagManage(); return; }
+  // Each selected file by name, so a picture sent together with others
+  // changes alone (#5799).
+  const items = [...this._mediaGallerySelected.values()].map(({ message_id, url }) => ({ messageId: message_id, url }));
   const mode = st.mode;
   const tags = st.tags.slice();
 
   const doEmit = () => {
-    this.socket.emit('bulk-tag-messages', { code: this.currentChannel, messageIds: ids, mode, tags }, (res) => {
+    this.socket.emit('bulk-tag-messages', { code: this.currentChannel, items, mode, tags }, (res) => {
       if (!res || res.error) {
         this._showToast?.(res && res.error ? res.error : t('media_gallery.tags_update_failed'), 'error');
         return;
       }
-      // Optimistically reflect each message's new set in the gallery data so
+      // Optimistically reflect each file's new set in the gallery data so
       // chips update without a full refetch (keeps the current selection).
-      const byId = new Map((res.results || []).map(r => [r.messageId, r.tags || []]));
+      const byKey = new Map((res.results || []).map(r => [this._mediaItemKey({ message_id: r.messageId, url: r.url }), r.tags || []]));
       if (this._mediaGalleryData) {
         ['photos', 'videos', 'audios', 'files'].forEach(k => {
           (this._mediaGalleryData[k] || []).forEach(it => {
-            if (byId.has(it.message_id)) {
-              const tg = byId.get(it.message_id);
+            const key = this._mediaItemKey(it);
+            if (byKey.has(key)) {
+              const tg = byKey.get(key);
               if (tg.length) it.tags = tg; else delete it.tags;
             }
           });

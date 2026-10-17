@@ -213,6 +213,10 @@ _enterMoveSelectionMode() {
   if (this._moveSelectionActive) return;
   this._moveSelectionActive = true;
   this._moveSelectedIds.clear();
+  // Where the selection is; "Move here as thread" can take it to another
+  // channel (app-move-to-thread.js).
+  this._moveSourceChannel = this.currentChannel;
+  this._watchMoveSelection?.(true);
   document.body.classList.add('move-selection-mode');
   const toolbar = document.getElementById('move-msg-toolbar');
   if (toolbar) toolbar.style.display = 'flex';
@@ -223,6 +227,9 @@ _exitMoveSelectionMode() {
   this._moveSelectionActive = false;
   this._moveSelectedIds.clear();
   this._lastMoveSelectedEl = null;
+  this._moveSourceChannel = null;
+  this._watchMoveSelection?.(false);
+  this._endMoveThreadPick?.();
   document.body.classList.remove('move-selection-mode');
   const toolbar = document.getElementById('move-msg-toolbar');
   if (toolbar) toolbar.style.display = 'none';
@@ -255,6 +262,7 @@ _updateMoveCount() {
   if (countEl) countEl.textContent = t('modals.move_messages.selected', { n });
   if (moveBtn) moveBtn.disabled = n === 0;
   if (deleteBtn) deleteBtn.disabled = n === 0;
+  this._syncMoveThreadUi?.();
 },
 
 _showMoveChannelPicker() {
@@ -268,14 +276,17 @@ _showMoveChannelPicker() {
   desc.textContent = t(_n === 1 ? 'modals.move_messages.move_one' : 'modals.move_messages.move_many', { n: _n });
   list.innerHTML = '';
 
+  const source = this._moveSourceChannel || this.currentChannel;
   const channels = (this.channels || []).filter(ch =>
-    !ch.is_dm && ch.code !== this.currentChannel
+    !ch.is_dm && ch.code !== source
   );
 
   if (channels.length === 0) {
     list.innerHTML = `<div class="move-msg-empty">${t('modals.move_messages.no_channels')}</div>`;
   } else {
     for (const ch of channels) {
+      const row = document.createElement('div');
+      row.className = 'move-msg-channel-row';
       const item = document.createElement('button');
       item.className = 'move-msg-channel-item';
       item.textContent = `# ${ch.name}`;
@@ -283,7 +294,14 @@ _showMoveChannelPicker() {
         this._executeMoveMessages(ch.code, ch.name);
         modal.style.display = 'none';
       });
-      list.appendChild(item);
+      // Or go there and pick a message to put them under as a thread.
+      const toThread = document.createElement('button');
+      toThread.className = 'move-msg-thread-pick';
+      toThread.textContent = `🧵 ${t('modals.move_messages.pick_in_channel')}`;
+      toThread.title = t('modals.move_messages.pick_in_channel_title', { name: ch.name });
+      toThread.addEventListener('click', () => this._startMoveThreadPick?.(ch.code));
+      row.append(item, toThread);
+      list.appendChild(row);
     }
   }
 
@@ -292,7 +310,7 @@ _showMoveChannelPicker() {
 
 _executeMoveMessages(toCode, toName) {
   const ids = [...this._moveSelectedIds];
-  const fromCode = this.currentChannel;
+  const fromCode = this._moveSourceChannel || this.currentChannel;
 
   this.socket.emit('move-messages', {
     messageIds: ids,
@@ -319,7 +337,7 @@ async _executeDeleteMessages() {
   if (!ok) return;
 
   const ids = [...this._moveSelectedIds];
-  const code = this.currentChannel;
+  const code = this._moveSourceChannel || this.currentChannel;
   // For E2E DMs the server can't read attachment URLs out of ciphertext, so
   // hand it the URLs per message the same way single-delete does. The move
   // selector is mod/non-DM gated today, but keep this future-proof.
@@ -404,6 +422,7 @@ _showMessageContextMenu(e, msgEl) {
   const canPin       = !!(this.user?.isAdmin || this._hasPerm('pin_message'));
   const canArchive   = !!(this.user?.isAdmin || this._hasPerm('archive_messages'));
   const canShareLink = !isDm && !!this._canShareChannelLink?.(this.currentChannel);
+  const postBlocked = !isDm && !!this._channelBlocksPosting?.(this.currentChannel);
   // Same level-vs-permission gap as the toolbar above (#5461).
   const canDelete    = isOwn || this.user?.isAdmin || this._canModerate() ||
                        this._hasPerm('delete_message');
@@ -428,8 +447,7 @@ _showMessageContextMenu(e, msgEl) {
   }
   // First group (as originally defined)
   if (isOwn && !isArchived) items.push(`<button class="channel-ctx-item" data-action="edit">✏️ <span>${t('msg_toolbar.edit')}</span></button>`);
-  items.push(`<button class="channel-ctx-item" data-action="reply">↩️ <span>${t('msg_toolbar.reply')}</span></button>`);
-  items.push(`<button class="channel-ctx-item" data-action="quote">💬 <span>${t('msg_toolbar.quote')}</span></button>`);
+  if (!postBlocked) items.push(`<button class="channel-ctx-item" data-action="reply">↩️ <span>${t('msg_toolbar.reply')}</span></button>`, `<button class="channel-ctx-item" data-action="quote">💬 <span>${t('msg_toolbar.quote')}</span></button>`);
   if (canPin) {
     items.push(isPinned
       ? `<button class="channel-ctx-item" data-action="unpin">📌 <span>${t('msg_toolbar.unpin')}</span></button>`
@@ -438,7 +456,7 @@ _showMessageContextMenu(e, msgEl) {
   // Separator, then the rest of the hover-toolbar actions
   items.push('<hr class="channel-ctx-sep">');
   items.push(`<button class="channel-ctx-item" data-action="react">😀 <span>${t('msg_toolbar.react')}</span></button>`);
-  if (!isDm) items.push(`<button class="channel-ctx-item" data-action="thread">🧵 <span>${t('msg_toolbar.thread')}</span></button>`);
+  if (!isDm && !postBlocked) items.push(`<button class="channel-ctx-item" data-action="thread">🧵 <span>${t('msg_toolbar.thread')}</span></button>`);
   if (canShareLink) items.push(`<button class="channel-ctx-item" data-action="copy-link">🔗 <span>${t('msg_toolbar.copy_link')}</span></button>`);
   if (canArchive) {
     items.push(isArchived
@@ -450,6 +468,10 @@ _showMessageContextMenu(e, msgEl) {
                           !!(this.user?.isAdmin || this._hasPerm('manage_roles') || this._hasPerm('promote_user'));
   if (canEditRoleMenu) items.push(`<button class="channel-ctx-item" data-action="edit-role-menu">🎭 <span>${t('settings.admin.role_menu.edit')}</span></button>`);
   if (canEditTags) items.push(`<button class="channel-ctx-item" data-action="edit-tags">🏷️ <span>${t('tags.edit')}</span></button>`);
+  if (this._canSetMessageNsfw?.(msgEl, isDm)) items.push(this._messageNsfwMenuHtml(msgEl.dataset.nsfw === '1'));
+  // Picking messages to move or put in a thread, starting with this one. The
+  // header's Select button is hidden on phones, so this is their way in.
+  if (!isDm && (this.user?.isAdmin || this._canModerate())) items.push(`<button class="channel-ctx-item" data-action="select-messages">☑️ <span>${t('header.select_messages_to_move')}</span></button>`);
   // Official message: mark your own; take the mark off your own, or anyone's
   // you could delete.
   const isHighlighted = msgEl.dataset.highlighted === '1';
@@ -484,6 +506,7 @@ _showMessageContextMenu(e, msgEl) {
     if (!btn) return;
     const action = btn.dataset.action;
     this._hideMessageContextMenu();
+    if (['reply', 'quote', 'thread'].includes(action) && this._channelBlocksPosting?.()) return this._showToast?.(t('thread_runtime.read_only_no_replies'), 'info');
     if (action === 'edit') {
       this._startEditMessage(msgEl, msgId);
     } else if (action === 'reply') {
@@ -522,6 +545,12 @@ _showMessageContextMenu(e, msgEl) {
       this._openRoleMenuBuilder?.({ messageId: msgId });
     } else if (action === 'edit-tags') {
       this._openMessageTagEditor(msgId, msgEl);
+    } else if (action === 'nsfw' || action === 'unnsfw') {
+      this._setMessageNsfw(msgId, action === 'nsfw');
+    } else if (action === 'select-messages') {
+      this._enterMoveSelectionMode();
+      this._toggleMoveSelect(msgEl);
+      this._lastMoveSelectedEl = msgEl;
     } else if (action === 'highlight-on' || action === 'highlight-off') {
       this.socket.emit('set-message-highlight', { messageId: msgId, on: action === 'highlight-on' });
     } else if (action === 'delete') {
@@ -669,7 +698,7 @@ _msgTagEditorSearch(query) {
   const input = document.getElementById('mte-input');
   if (!input || !this.socket || !this._msgTagEditor) return;
   const q = query;
-  this.socket.emit('search-upload-tags', { query: q }, (res) => {
+  this.socket.emit('search-upload-tags', { query: q, code: this.currentChannel }, (res) => {
     if (!this._msgTagEditor || input.value !== q) return;
     if (res && res.error === 'rate_limited') return;
     this._msgTagEditorRenderList(q, (res && res.tags) || []);

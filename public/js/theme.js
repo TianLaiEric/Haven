@@ -177,6 +177,9 @@ function applyCustomVars(palette) {
   // must not leave the light one behind.
   if (!('--accent-text' in palette)) root.removeProperty('--accent-text');
   _cachePalette(palette);
+  // Read from the palette itself: RGB calls this many times a second, too
+  // often to ask the browser for computed styles.
+  _setColorScheme(window.HavenThemeCompat?.colorSchemeFor?.(palette['--bg-primary']));
 }
 
 // theme-init.js paints the first frame from the last palette shown, so a
@@ -208,7 +211,73 @@ function clearCustomVars() {
     '--text-link','--border','--border-light','--success','--danger','--warning',
     '--led-on','--led-off','--led-glow'];
   keys.forEach(k => document.documentElement.style.removeProperty(k));
+  scheduleColorSchemeSync();
 }
+
+// ── Light or dark native controls ───────────────────────
+// The list a <select> opens, scrollbars and date pickers are drawn by the
+// browser, which picks light or dark from color-scheme. data-color-scheme on
+// <html> carries the active theme's answer (style-themes.css turns it into
+// color-scheme), worked out from the theme's own --bg-primary, so built-in,
+// published and Custom themes all get it without a list kept by hand.
+// theme-init.js reads the stored copy so the first frame already has it.
+const COLOR_SCHEME_KEY = 'haven_color_scheme';
+let _colorSchemeProbe = null;
+let _colorSchemeTimer = 0;
+
+function _setColorScheme(scheme) {
+  if (scheme !== 'light' && scheme !== 'dark') return;
+  const root = document.documentElement;
+  if (root.getAttribute('data-color-scheme') === scheme) return;
+  root.setAttribute('data-color-scheme', scheme);
+  try {
+    localStorage.setItem(COLOR_SCHEME_KEY, scheme);
+  } catch {
+    // Storage unavailable: the next load works the scheme out again.
+  }
+}
+
+function syncColorScheme() {
+  _colorSchemeTimer = 0;
+  const compat = window.HavenThemeCompat;
+  if (!compat?.colorSchemeFor || !document.body) return;
+  // The browser resolves the token to rgb() on an element, whatever color
+  // syntax the theme wrote it in.
+  if (!_colorSchemeProbe || !_colorSchemeProbe.isConnected) {
+    _colorSchemeProbe = document.createElement('span');
+    _colorSchemeProbe.setAttribute('aria-hidden', 'true');
+    _colorSchemeProbe.setAttribute('data-haven-color-probe', '');
+    _colorSchemeProbe.style.cssText = 'display:none;color:var(--bg-primary)';
+    document.body.appendChild(_colorSchemeProbe);
+  }
+  _setColorScheme(compat.colorSchemeFor(getComputedStyle(_colorSchemeProbe).color));
+}
+
+// A timer rather than an animation frame: frames pause in a hidden window,
+// and a theme switched there would keep the old scheme until shown.
+function scheduleColorSchemeSync() {
+  if (_colorSchemeTimer) return;
+  _colorSchemeTimer = setTimeout(syncColorScheme, 0);
+}
+
+// Built-in themes switch by data-theme; published themes by adding or
+// removing a stylesheet, whose colors only count once it has loaded.
+function _watchColorScheme() {
+  if (typeof MutationObserver === 'function') {
+    const observer = new MutationObserver(scheduleColorSchemeSync);
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    if (document.head) observer.observe(document.head, { childList: true });
+  }
+  document.addEventListener('load', (e) => {
+    if (e.target?.tagName === 'LINK') scheduleColorSchemeSync();
+  }, true);
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', scheduleColorSchemeSync, { once: true });
+  } else {
+    scheduleColorSchemeSync();
+  }
+}
+_watchColorScheme();
 
 // ═══════════════════════════════════════════════════════════
 // RGB CYCLING THEME
@@ -605,8 +674,8 @@ let _scrambleTargets = [];  // tracked { el, original } for multi-element scramb
 
 // Layer definitions: each effect -> array of { id, parent, cls }
 const FX_LAYERS = {
-  crt:        [{ id: 'fx-crt-vignette', parent: '#fx-layers', cls: 'fx-crt-vignette' },
-               { id: 'fx-crt-scanlines', parent: '#fx-layers', cls: 'fx-crt-scanlines' }],
+  crt:        [{ id: 'fx-crt-vignette', parent: '#fx-overlay', cls: 'fx-crt-vignette' },
+               { id: 'fx-crt-scanlines', parent: '#fx-overlay', cls: 'fx-crt-scanlines' }],
   matrix:     [],  // digital rain handled entirely by JS canvas
   matrixbars: [{ id: 'fx-matrix-bars', parent: '.sidebar', cls: 'fx-matrix-bars' }],
   fallout:    [{ id: 'fx-fallout-vignette', parent: '#fx-layers', cls: 'fx-fallout-vignette' }],
@@ -640,14 +709,47 @@ const FX_CANVAS = {
   cyberpunk: { start: _startTextScramble, stop: _stopTextScramble }
 };
 
+// Effects are drawn in the chat column, behind its messages (the stacking
+// rules are in style-status-effects.css). Only the CRT screen goes over the
+// whole window, in #fx-overlay.
 function _ensureFxLayers() {
+  const main = document.querySelector('.main');
   let c = document.getElementById('fx-layers');
   if (!c) {
     c = document.createElement('div');
     c.id = 'fx-layers';
+  }
+  if (main && c.parentElement !== main) main.prepend(c);
+  else if (!main && !c.isConnected) document.body.appendChild(c);
+  // Pages without a chat column (sign-in) draw it behind the whole page.
+  c.classList.toggle('fx-layers-page', !main);
+  return c;
+}
+
+function _ensureFxOverlay() {
+  let c = document.getElementById('fx-overlay');
+  if (!c) {
+    c = document.createElement('div');
+    c.id = 'fx-overlay';
     document.body.appendChild(c);
   }
   return c;
+}
+
+// The particle canvases match the chat column, which changes size without
+// the window doing so (the member list, the thread panel beside it).
+const _fxResizers = new Set();
+let _fxResizeObserver = null;
+function _fxWatchSize(canvas, resize) {
+  _fxResizers.add({ canvas, resize });
+  if (_fxResizeObserver || typeof ResizeObserver !== 'function') return;
+  _fxResizeObserver = new ResizeObserver(() => {
+    for (const r of _fxResizers) {
+      if (!r.canvas.isConnected) { _fxResizers.delete(r); continue; }
+      r.resize();
+    }
+  });
+  _fxResizeObserver.observe(_ensureFxLayers());
 }
 
 function _activateEffect(name) {
@@ -660,12 +762,13 @@ function _activateEffect(name) {
   // Overlay layers
   (FX_LAYERS[name] || []).forEach(layer => {
     if (document.getElementById(layer.id)) return;
-    const parent = layer.parent === '#fx-layers'
-      ? _ensureFxLayers()
+    const own = layer.parent === '#fx-layers' || layer.parent === '#fx-overlay';
+    const parent = layer.parent === '#fx-layers' ? _ensureFxLayers()
+      : layer.parent === '#fx-overlay' ? _ensureFxOverlay()
       : document.querySelector(layer.parent);
     if (!parent) return;
     // Ensure parent is positioned
-    if (layer.parent !== '#fx-layers') {
+    if (!own) {
       const pos = getComputedStyle(parent).position;
       if (pos === 'static') parent.style.position = 'relative';
     }
@@ -1111,9 +1214,10 @@ function _startEmbers() {
   container.appendChild(canvas);
 
   function resize() {
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
+    canvas.width = container.clientWidth || window.innerWidth;
+    canvas.height = container.clientHeight || window.innerHeight;
   }
+  _fxWatchSize(canvas, resize);
   resize();
 
   _emberCtx = canvas.getContext('2d');
@@ -1214,9 +1318,10 @@ function _startGraceEmbers() {
   container.appendChild(canvas);
 
   function resize() {
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
+    canvas.width = container.clientWidth || window.innerWidth;
+    canvas.height = container.clientHeight || window.innerHeight;
   }
+  _fxWatchSize(canvas, resize);
   resize();
 
   _graceCtx = canvas.getContext('2d');
@@ -1331,9 +1436,10 @@ function _startNordSnow() {
   container.appendChild(canvas);
 
   function resize() {
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
+    canvas.width = container.clientWidth || window.innerWidth;
+    canvas.height = container.clientHeight || window.innerHeight;
   }
+  _fxWatchSize(canvas, resize);
   resize();
 
   _snowCtx = canvas.getContext('2d');
@@ -1713,12 +1819,16 @@ function initCustomThemeEditor() {
   function redrawHue() { drawHueBar(hueCtx, hueCanvas.width, hueCanvas.height, hue); }
   function redrawTri()  { drawTriangle(triCtx, triCanvas.width, triCanvas.height, hue, sat, val); }
 
+  function paintSwatch(palette) {
+    const swatch = document.getElementById('custom-theme-swatch');
+    if (swatch) swatch.style.background = palette['--accent'];
+  }
+
   function apply() {
     const palette = generateCustomPalette(hue, sat, val, sat, isLightColorBase());
     applyCustomVars(palette);
     localStorage.setItem('haven_custom_hsv', JSON.stringify({ h: hue, s: sat, v: val }));
-    const swatch = document.getElementById('custom-theme-swatch');
-    if (swatch) swatch.style.background = palette['--accent'];
+    paintSwatch(palette);
   }
 
   function render() { redrawHue(); redrawTri(); apply(); }
@@ -1759,7 +1869,14 @@ function initCustomThemeEditor() {
   triCanvas.addEventListener('touchstart', (e) => { e.preventDefault(); triFromEvent(e); });
   triCanvas.addEventListener('touchmove',  (e) => { e.preventDefault(); triFromEvent(e); });
 
-  render();
+  // Draw the picker and the swatch only. Applying the palette here put
+  // Custom's colors over every other theme on each page load, so an account
+  // with no saved theme saw Custom instead of Haven. The palette is applied
+  // when Custom is the selected theme: initThemeSwitcher, a picker click,
+  // applyThemeFromServer, or _show() below.
+  redrawHue();
+  redrawTri();
+  paintSwatch(generateCustomPalette(hue, sat, val, sat, isLightColorBase()));
 
   editor._show = () => { editor.style.display = 'block'; render(); };
   editor._hide = () => { editor.style.display = 'none'; };
@@ -1805,8 +1922,8 @@ function initThemeSwitcher(containerId, socket) {
   // File themes are restored by plugin-loader after it fetches theme metadata.
   // Nothing to do here for 'file:...'; it will be handled once the loader runs.
 
-  // Set active button (file: theme buttons are injected later by plugin-loader,
-  // so they will pick up the active state via injectPublishedThemeButtons)
+  // Set active button (theme files get theirs from the theme picker, which
+  // draws their cards once plugin-loader has the theme list)
   container.querySelectorAll('.theme-btn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.theme === saved);
     if (recoveryMode) btn.disabled = true;
@@ -1970,32 +2087,32 @@ function applyThemeFromServer(theme, persist = true, syncFallback = false) {
 // ═══════════════════════════════════════════════════════════
 // Published (file:) themes, shared with the login page
 // ═══════════════════════════════════════════════════════════
-// A theme an admin publishes is a .theme.css file rather than one of the
-// built-in data-theme values, so applying it means injecting a stylesheet.
-// plugin-loader.js already did that, but the loader only runs on the app page,
-// which left the login page with no custom themes in its picker and no way to
-// honour one that the admin had set as the server default. These two helpers
-// live in theme.js because theme.js is the file every page loads. (#5537)
+// A published theme is a .theme.css file rather than a built-in data-theme
+// value, so applying it means injecting a stylesheet. These helpers live here
+// because theme.js is the file every page loads, the login page too. (#5537)
 
-// Inject a published theme's stylesheet and make it the active theme.
-// Deliberately the minimum: no plugin bookkeeping, no effect re-run, no socket.
-// plugin-loader's applyFileTheme() calls this for the shared half and then does
-// its own extra work on top, so the injection itself cannot drift between them.
+// Inject a published theme's stylesheet and make it the active theme. Just
+// that: plugin-loader's applyFileTheme() calls it and does its own extra work.
 function applyPublishedThemeBase(file, persist = true, meta = null) {
   if (!file || _isHavenSafeMode() || _isThemeRecoveryPending()) return null;
   const compatibility = meta || window.HavenThemeCompat?.getCachedTheme?.(file);
   if (!_isFileThemeCompatible(compatibility)) return null;
-  document.querySelectorAll('link[id^="haven-theme-"]').forEach(l => l.remove());
-
+  // The theme on screen stays until the new sheet has loaded, so a switch
+  // never flashes the bare Haven base. The old sheets are renamed at once, so
+  // a lookup by theme id already treats them as gone.
+  const stale = [...document.querySelectorAll('link[id^="haven-theme-"]')];
+  stale.forEach((link, i) => { link.id = `haven-theme-stale-${i}-${Date.now()}`; });
   const linkEl = document.createElement('link');
   linkEl.rel = 'stylesheet';
   linkEl.href = `/themes/${encodeURIComponent(file)}?_=${Date.now()}`;
   linkEl.id = `haven-theme-${file}`;
+  // 'haven' is the stable layout base; the sheet loads after it and overrides the :root variables.
+  const settle = () => {
+    stale.forEach(link => link.remove());
+    if (linkEl.isConnected) document.documentElement.setAttribute('data-theme', 'haven');
+  };
+  ['load', 'error'].forEach(type => linkEl.addEventListener(type, settle, { once: true }));
   document.head.appendChild(linkEl);
-
-  // 'haven' is the stable layout base; the injected sheet loads after it and
-  // overrides the :root variables.
-  document.documentElement.setAttribute('data-theme', 'haven');
 
   if (persist) {
     try { localStorage.setItem('haven_theme', `file:${file}`); } catch { /* storage blocked (private mode): nothing is remembered, nothing else breaks */ }
